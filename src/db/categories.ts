@@ -1,6 +1,6 @@
 import { newId } from "../lib/id";
 import { DEFAULT_CATEGORIES } from "../lib/defaultCategories";
-import type { Category, CategoryKind, Envelope } from "../types";
+import type { Category, CategoryKind, Envelope, RolloverMode } from "../types";
 import { getScoped, listScoped, NotFoundError, nowIso } from "./client";
 import { archiveEnvelopeForCategory, unarchiveEnvelopeForCategory } from "./envelopes";
 
@@ -58,7 +58,7 @@ export async function createEnvelopeForCategory(
   db: D1Database,
   householdId: string,
   category: Category,
-  opts: { groupName?: string; monthlyTargetCents?: number | null; targetDate?: string | null } = {},
+  opts: { groupName?: string; monthlyTargetCents?: number | null; targetDate?: string | null; rolloverMode?: RolloverMode } = {},
 ): Promise<Envelope> {
   if (category.kind !== "expense" && category.kind !== "savings") {
     throw new Error(`category kind '${category.kind}' is not funded and has no envelope`);
@@ -66,10 +66,11 @@ export async function createEnvelopeForCategory(
   const id = newId("env");
   const now = nowIso();
   const groupName = opts.groupName ?? "Uncategorized";
+  const rolloverMode = opts.rolloverMode ?? "carry";
   await db
     .prepare(
-      `INSERT INTO envelope (id, household_id, category_id, group_name, sort_order, monthly_target_cents, target_date, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO envelope (id, household_id, category_id, group_name, sort_order, monthly_target_cents, target_date, rollover_mode, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -79,6 +80,7 @@ export async function createEnvelopeForCategory(
       0,
       opts.monthlyTargetCents ?? null,
       opts.targetDate ?? null,
+      rolloverMode,
       now,
       now,
     )
@@ -91,6 +93,7 @@ export async function createEnvelopeForCategory(
     sort_order: 0,
     monthly_target_cents: opts.monthlyTargetCents ?? null,
     target_date: opts.targetDate ?? null,
+    rollover_mode: rolloverMode,
     archived_at: null,
     created_at: now,
     updated_at: now,

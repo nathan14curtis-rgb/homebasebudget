@@ -723,6 +723,21 @@ function EnvelopeRow({
     }
   }
 
+  /** Whether this envelope's leftovers survive the turn of the month. The
+   * per-month adjustments above ("release", "change rollover amount") fix
+   * one month; this is the standing answer, and the backend settles it
+   * with a correction entry the next time the month is read. */
+  async function toggleRolloverMode() {
+    const next = envelope.rollover_mode === "reset" ? "carry" : "reset";
+    setActionError(null);
+    try {
+      await api.updateEnvelope(householdId, envelope.id, { rolloverMode: next });
+      await onChanged();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to change rollover setting");
+    }
+  }
+
   async function editExpenseSeries() {
     if (!category) return;
     const name = window.prompt("Rename this expense", category.name);
@@ -757,7 +772,11 @@ function EnvelopeRow({
             {txnCount} transaction{txnCount === 1 ? "" : "s"}
             {upcomingCount > 0 ? `, ${upcomingCount} upcoming` : ""} in:
             <span className="badge badge--soft badge--muted">{envelope.group_name}</span>
-            <span aria-hidden title="Rolls over month to month" style={{ color: "var(--faint)" }}>⟲</span>
+            {envelope.rollover_mode === "reset" ? (
+              <span aria-hidden title="Starts fresh every month" style={{ color: "var(--faint)" }}>↺</span>
+            ) : (
+              <span aria-hidden title="Rolls over month to month" style={{ color: "var(--faint)" }}>⟲</span>
+            )}
           </span>
         </div>
 
@@ -810,6 +829,11 @@ function EnvelopeRow({
             },
             { label: "Edit", icon: "🗓", onClick: onEdit },
             { label: "Change rollover amount", icon: "⇄", onClick: changeRolloverAmount },
+            {
+              label: envelope.rollover_mode === "reset" ? "Roll leftovers over each month" : "Start fresh each month",
+              icon: "⟲",
+              onClick: toggleRolloverMode,
+            },
             ...(onViewSeries ? [{ label: "View series", icon: "⇗", onClick: onViewSeries }] : []),
             { label: "Rename", icon: "✎", onClick: editExpenseSeries },
             { label: "Archive", icon: "🗄", danger: true, onClick: onArchive },

@@ -174,7 +174,7 @@ describe("envelope ledger", () => {
     await applyCategorization(db, household.id, txn.id, { categoryId: groceries.id, method: "human" });
 
     const summary = await getEnvelopeMonthSummary(db, household.id, envelope.id, "2026-03");
-    expect(summary).toEqual({ month: "2026-03", allocatedCents: 60000, spentCents: 4523, balanceCents: 55477 });
+    expect(summary).toEqual({ month: "2026-03", allocatedCents: 60000, spentCents: 4523, balanceCents: 55477, carriedInCents: 0 });
   });
 
   it("carries a negative balance forward into the next month (PLAN.md §8.2)", async () => {

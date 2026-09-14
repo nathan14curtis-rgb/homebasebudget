@@ -69,7 +69,7 @@ describe("getEnvelopeMonthSummariesForHousehold", () => {
     const envelopes = await listEnvelopes(db, household.id);
     const bulk = await getEnvelopeMonthSummariesForHousehold(db, household.id, "2026-03");
     for (const envelope of envelopes) {
-      expect(bulk[envelope.id]).toEqual({ month: "2026-03", allocatedCents: 0, spentCents: 0, balanceCents: 0 });
+      expect(bulk[envelope.id]).toEqual({ month: "2026-03", allocatedCents: 0, spentCents: 0, balanceCents: 0, carriedInCents: 0 });
     }
   });
 });
