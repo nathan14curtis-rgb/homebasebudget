@@ -3,6 +3,7 @@ import { requireParam } from "../lib/http";
 import type { Env } from "../types";
 import {
   allocateToEnvelope,
+  applyRolloverResets,
   getEnvelopeMonthSummariesForHousehold,
   getEnvelopeMonthSummary,
   listEnvelopes,
@@ -27,17 +28,31 @@ envelopesRoute.get("/", async (c) => {
 envelopesRoute.get("/summary", async (c) => {
   const month = c.req.query("month");
   if (!month || !MONTH_RE.test(month)) return c.json({ error: "month query param must be 'YYYY-MM'" }, 400);
+  // Envelopes set to reset their rollover are settled the moment anyone
+  // looks at the month (src/db/envelopes.ts) — before the totals are read,
+  // so the page never shows a carried-in figure the setting says shouldn't
+  // exist.
+  await applyRolloverResets(c.env.DB, requireParam(c, "householdId"), month);
   const summaries = await getEnvelopeMonthSummariesForHousehold(c.env.DB, requireParam(c, "householdId"), month);
   return c.json(summaries);
 });
 
 // group_name (which powers the dashboard's Bills view — an envelope
-// grouped "Bills" instead of, say, "Everyday"), monthly_target_cents, and
+// grouped "Bills" instead of, say, "Everyday"), monthly_target_cents,
 // target_date (turning an envelope into a goal after creation, not just
-// at creation time via routes/categories.ts) are what's worth editing
+// at creation time via routes/categories.ts) and rollover_mode (whether
+// leftover money survives the turn of the month) are what's worth editing
 // about an envelope after creation.
 envelopesRoute.patch("/:envelopeId", async (c) => {
-  const body = await c.req.json<{ groupName?: string; monthlyTargetCents?: number | null; targetDate?: string | null }>();
+  const body = await c.req.json<{
+    groupName?: string;
+    monthlyTargetCents?: number | null;
+    targetDate?: string | null;
+    rolloverMode?: "carry" | "reset";
+  }>();
+  if (body.rolloverMode !== undefined && body.rolloverMode !== "carry" && body.rolloverMode !== "reset") {
+    return c.json({ error: "rolloverMode must be 'carry' or 'reset'" }, 400);
+  }
   const envelope = await updateEnvelope(c.env.DB, requireParam(c, "householdId"), requireParam(c, "envelopeId"), body);
   return c.json(envelope);
 });
@@ -45,6 +60,7 @@ envelopesRoute.patch("/:envelopeId", async (c) => {
 envelopesRoute.get("/:envelopeId/summary", async (c) => {
   const month = c.req.query("month");
   if (!month || !MONTH_RE.test(month)) return c.json({ error: "month query param must be 'YYYY-MM'" }, 400);
+  await applyRolloverResets(c.env.DB, requireParam(c, "householdId"), month);
   const summary = await getEnvelopeMonthSummary(c.env.DB, requireParam(c, "householdId"), requireParam(c, "envelopeId"), month);
   return c.json(summary);
 });

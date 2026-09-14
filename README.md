@@ -39,6 +39,28 @@ with tools that read and write the household's real data
   $4,000 vacation fund by next June"*, *"always file Maverik as gas"* →
   written, then confirmed with the number that matters now
 
+**The whole budget is writable by text**, not a slice of it — anything the
+dashboard can do, a message can:
+
+| Say | What happens |
+| --- | --- |
+| *"make groceries $250 this month, nothing rolled over"* | this month's funding is set to exactly $250 and the opening balance is corrected in the prior month — the monthly target for every *other* month is left alone (`set_month_budget`) |
+| *"groceries should be $250 from now on"* | the envelope's monthly target changes (`update_spending_plan`) |
+| *"groceries should start fresh every month"* | the envelope switches to `rollover: reset`, and each new month's leftover is zeroed with a visible correction entry |
+| *"set up October the usual way"* | every envelope with a target is funded up to it in one pass (`fund_month_from_plan`) |
+| *"what have we actually been spending?"* → *"okay, use those"* | per-category monthly averages, then a bulk retarget (`suggest_budget_from_history`, `set_targets_in_bulk`) |
+| *"add my $95 internet bill on the 5th"* / *"the power bill is $240 this month"* | a recurring series, or just this month's occurrence of one — the distinction is kept (`create_recurring_series`, `update_bill_occurrence`) |
+| *"the Costco run was $120 groceries and $60 household"* | the charge is split across categories (`split_transaction`) |
+| *"tag that reimbursable"*, *"call it Trader Joe's"*, *"that was $48.20 not $42.80"* | tags, payee, amount, date, memo, flags (`tag_transaction`, `update_transaction`) |
+| *"undo that"* / *"put the grocery change from Tuesday back"* | every write is logged with a before-image and reversed by id (`list_recent_changes`, `undo_change`) |
+
+Two guardrails sit under all of it. Anything that throws part of the plan
+away — archiving, merging, ending or deleting a series — is only performed
+after the person agrees in the thread, and a household member's
+`access_level` decides what they can do by text: `view_only` can ask
+anything and change nothing, `limited` can categorize and tag but not
+re-plan, `full` does everything.
+
 Both sides of every exchange are stored, so follow-ups work ("what about
 last month?"). The same agent and the same thread are available in the
 dashboard under **Ask the bot**, and over the API at

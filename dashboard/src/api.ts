@@ -83,6 +83,9 @@ export interface Envelope {
   // ISO date. A savings-goal envelope (PLAN.md §8.5: not a separate table)
   // is a kind='savings' envelope with this set — see the Goals page.
   target_date: string | null;
+  // 'carry' leaves unspent money in the envelope next month; 'reset'
+  // starts every month at zero (migration 0011). Set from here or by text.
+  rollover_mode: "carry" | "reset";
   archived_at: string | null;
 }
 
@@ -91,6 +94,8 @@ export interface EnvelopeMonthSummary {
   allocatedCents: number;
   spentCents: number;
   balanceCents: number;
+  /** What carried in from last month: balance − allocated + spent. */
+  carriedInCents: number;
 }
 
 export interface Transaction {
@@ -281,7 +286,7 @@ export const api = {
   updateEnvelope: (
     householdId: string,
     envelopeId: string,
-    input: { groupName?: string; monthlyTargetCents?: number | null; targetDate?: string | null },
+    input: { groupName?: string; monthlyTargetCents?: number | null; targetDate?: string | null; rolloverMode?: "carry" | "reset" },
   ) => request<Envelope>(`/households/${householdId}/envelopes/${envelopeId}`, { method: "PATCH", body: JSON.stringify(input) }),
   getEnvelopeSummary: (householdId: string, envelopeId: string, month: string) =>
     request<EnvelopeMonthSummary>(`/households/${householdId}/envelopes/${envelopeId}/summary?month=${month}`),

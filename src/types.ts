@@ -8,6 +8,11 @@ export type TransactionSource = "plaid" | "csv_import" | "manual";
 export type TransactionFlagColor = "red" | "orange" | "yellow" | "green" | "blue" | "purple";
 export type ClassificationMethod = "rule" | "memory" | "llm" | "human";
 export type AllocationSource = "income_assignment" | "envelope_move" | "correction";
+/** Whether an envelope's leftover money survives the turn of the month.
+ * 'carry' is the ledger's natural behavior (PLAN.md §3); 'reset' zeroes
+ * what carried in at the start of each month with a correction entry, for
+ * the envelopes a household thinks of as starting fresh. */
+export type RolloverMode = "carry" | "reset";
 export type ClarificationStatus = "queued" | "sent" | "answered" | "timed_out";
 export type RuleSource = "user" | "ai_suggested";
 export type AccessLevel = "full" | "limited" | "view_only";
@@ -163,6 +168,7 @@ export interface Envelope {
   sort_order: number;
   monthly_target_cents: number | null;
   target_date: string | null;
+  rollover_mode: RolloverMode;
   archived_at: string | null;
   created_at: string;
   updated_at: string;
@@ -373,4 +379,18 @@ export interface Env {
   SENDBLUE_FROM_NUMBER?: string; // the Sendblue-assigned number to send from — required by their API
   SENDBLUE_API_BASE_URL?: string; // default https://api.sendblue.com/api
   ANTHROPIC_API_KEY?: string;
+}
+
+/** One write an agent turn made, with a before-image good enough to undo
+ * it (migration 0011). Text has no cancel button; this table is it. */
+export interface AgentChangeLogEntry {
+  id: string;
+  household_id: string;
+  user_id: string | null;
+  tool_name: string;
+  summary: string;
+  undo: string;
+  reverted_at: string | null;
+  reverted_by_id: string | null;
+  created_at: string;
 }

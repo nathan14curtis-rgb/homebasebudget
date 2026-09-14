@@ -1,5 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import type { Category, Env, Envelope } from "../types";
+import type { AccessLevel, Env } from "../types";
 import { listAccounts } from "../db/accounts";
 import {
   archiveCategory,
@@ -8,9 +8,11 @@ import {
   listCategories,
   renameCategory,
 } from "../db/categories";
+import { recordChange } from "../db/changeLog";
 import { getLatestClarificationForTransaction, listOpenClarificationsForHousehold, markClarificationAnswered } from "../db/clarifications";
 import {
   allocateToEnvelope,
+  applyRolloverResets,
   getEnvelopeMonthSummariesForHousehold,
   listEnvelopes,
   moveMoneyBetweenEnvelopes,
@@ -20,14 +22,42 @@ import { listRecurringPatterns } from "../db/recurringPatterns";
 import { createRule } from "../db/rules";
 import { applyCategorization, getTransaction, listTransactions, setTransactionExcluded } from "../db/transactions";
 import type { Condition } from "../categorization/rules";
+import {
+  accessDeniedMessage,
+  accessLevelAllows,
+  AgentToolError,
+  bool,
+  currentMonth,
+  envelopeUndoEntry,
+  formatDollars,
+  isoDaysAgo,
+  monthArg,
+  num,
+  required,
+  requireConfirmation,
+  resolveCategory,
+  resolveEnvelope,
+  str,
+  toCents,
+  toDollars,
+  type AgentTool,
+  type AgentToolContext,
+  type ChangeRecord,
+  type ToolRunContext,
+} from "./agentToolKit";
+import { PLAN_TOOLS } from "./planTools";
+import { SERIES_TOOLS } from "./seriesTools";
+import { TRANSACTION_TOOLS } from "./transactionTools";
+import { UNDO_TOOLS } from "./undoTools";
 
 /**
  * The tools the conversational bot (src/messaging/agent.ts) can call.
  *
  * Everything the household can do from the dashboard — look at any slice
  * of their data, recategorize a charge, retarget an envelope, move money,
- * add a category, start a goal — is reachable from a text message through
- * this list. Two rules hold the whole thing together:
+ * add a category, start a goal, rewrite a recurring bill, take back
+ * yesterday's mistake — is reachable from a text message through this
+ * registry. Four rules hold the whole thing together:
  *
  *  1. Every tool is household-scoped by the context, never by an argument.
  *     The model cannot name a household; it only ever operates on the one
@@ -36,109 +66,25 @@ import type { Condition } from "../categorization/rules";
  *     use, so a text-message edit produces the same audit rows, the same
  *     merchant-memory reinforcement, and the same ledger entries as a
  *     dashboard edit. No tool writes SQL of its own.
+ *  3. Every write records how to undo itself (src/messaging/undo.ts).
+ *     Text has no cancel button; "undo that" is the whole safety net.
+ *  4. Every tool declares what kind of power it exercises, and the
+ *     household member's access_level decides whether they get it
+ *     (src/messaging/agentToolKit.ts).
  *
  * Amounts cross this boundary in dollars, not cents — the model reads and
  * writes what the person actually said ("$250"), and the conversion to
- * integer cents happens exactly once, here.
+ * integer cents happens exactly once, at the edge.
+ *
+ * The tools themselves live in four groups by subject — planTools.ts
+ * (envelopes, targets, funding, rollover), seriesTools.ts (recurring bills
+ * and their occurrences), transactionTools.ts (editing, splitting,
+ * tagging) and undoTools.ts — plus the everyday read and categorize tools
+ * below, which are the ones a normal text actually reaches.
  */
 
-export interface AgentToolContext {
-  householdId: string;
-  /** Who is talking, for attribution on writes. Null for the dashboard's
-   * unauthenticated-in-agent-terms callers and scheduled runs. */
-  userId: string | null;
-}
-
-interface AgentTool {
-  definition: Anthropic.Tool;
-  /** True for anything that changes stored data — used to summarize what a
-   * turn actually did, and to keep read-only turns cheap to reason about. */
-  mutates: boolean;
-  run(env: Env, ctx: AgentToolContext, input: Record<string, unknown>): Promise<unknown>;
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-function toCents(dollars: number): number {
-  return Math.round(dollars * 100);
-}
-
-function toDollars(cents: number): number {
-  return Math.round(cents) / 100;
-}
-
-function currentMonth(): string {
-  return new Date().toISOString().slice(0, 7);
-}
-
-function isoDaysAgo(days: number): string {
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-
-function str(input: Record<string, unknown>, key: string): string | null {
-  const value = input[key];
-  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
-}
-
-function num(input: Record<string, unknown>, key: string): number | null {
-  const value = input[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function bool(input: Record<string, unknown>, key: string): boolean | null {
-  const value = input[key];
-  return typeof value === "boolean" ? value : null;
-}
-
-function required(input: Record<string, unknown>, key: string): string {
-  const value = str(input, key);
-  if (value === null) throw new AgentToolError(`'${key}' is required`);
-  return value;
-}
-
-/** A tool failure the model is expected to read and recover from (a
- * category name that doesn't exist, an amount that doesn't parse) rather
- * than an internal fault. Surfaces as an is_error tool_result so the model
- * can correct itself in the same turn instead of the whole reply dying. */
-export class AgentToolError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "AgentToolError";
-  }
-}
-
-/** Categories are addressed by name in conversation ("groceries"), by id
- * in the data. Accept either, and when neither matches, fail with the list
- * of real names so the model's next attempt can be right. */
-async function resolveCategory(env: Env, householdId: string, nameOrId: string): Promise<Category> {
-  const categories = await listCategories(env.DB, householdId);
-  const byId = categories.find((c) => c.id === nameOrId);
-  if (byId) return byId;
-  const needle = nameOrId.trim().toLowerCase();
-  const exact = categories.filter((c) => c.name.toLowerCase() === needle);
-  if (exact.length === 1) return exact[0]!;
-  const partial = categories.filter((c) => c.name.toLowerCase().includes(needle) && !c.archived_at);
-  if (partial.length === 1) return partial[0]!;
-  const active = categories.filter((c) => !c.archived_at).map((c) => c.name);
-  if (partial.length > 1) {
-    throw new AgentToolError(`'${nameOrId}' matches more than one category (${partial.map((c) => c.name).join(", ")}) — use the exact name.`);
-  }
-  throw new AgentToolError(`No category named '${nameOrId}'. Existing categories: ${active.join(", ")}.`);
-}
-
-async function resolveEnvelope(env: Env, householdId: string, categoryNameOrId: string): Promise<{ category: Category; envelope: Envelope }> {
-  const category = await resolveCategory(env, householdId, categoryNameOrId);
-  const envelopes = await listEnvelopes(env.DB, householdId);
-  const envelope = envelopes.find((e) => e.category_id === category.id);
-  if (!envelope) {
-    throw new AgentToolError(
-      `'${category.name}' is a ${category.kind} category and has no envelope — only expense and savings categories hold money.`,
-    );
-  }
-  return { category, envelope };
-}
+export type { AgentToolContext } from "./agentToolKit";
+export { AgentToolError } from "./agentToolKit";
 
 // ---------------------------------------------------------------------------
 // Read tools
@@ -146,10 +92,11 @@ async function resolveEnvelope(env: Env, householdId: string, categoryNameOrId: 
 
 const getSpendingPlan: AgentTool = {
   mutates: false,
+  access: "read",
   definition: {
     name: "get_spending_plan",
     description:
-      "The household's whole spending plan for a month: every envelope with its group, monthly target (what they plan to spend), what they've actually spent this month, and the running balance carried through this month. Use this for any 'how much is left', 'are we over', 'what's the plan' question.",
+      "The household's whole spending plan for a month. Per envelope: its group, the monthly target (what they plan to spend every month), what is funded into this month, what carried in from last month, what they have actually spent, the balance left, and whether leftovers roll over or reset. Use this for any 'how much is left', 'are we over', 'what's the plan' question, and read it before changing any number so the change is a delta off something real.",
     input_schema: {
       type: "object",
       properties: {
@@ -159,7 +106,12 @@ const getSpendingPlan: AgentTool = {
     },
   },
   async run(env, ctx, input) {
-    const month = str(input, "month") ?? currentMonth();
+    const month = monthArg(input);
+    // Envelopes set to reset their rollover only actually reset when
+    // someone looks (src/db/envelopes.ts) — the ledger entry is written
+    // here, before the numbers are read, so the plan never shows a
+    // carried-in figure the setting says shouldn't exist.
+    await applyRolloverResets(env.DB, ctx.householdId, month);
     const [envelopes, categories, summaries] = await Promise.all([
       listEnvelopes(env.DB, ctx.householdId),
       listCategories(env.DB, ctx.householdId),
@@ -177,8 +129,11 @@ const getSpendingPlan: AgentTool = {
             category_id: e.category_id,
             group: e.group_name,
             planned_dollars: e.monthly_target_cents === null ? null : toDollars(e.monthly_target_cents),
+            funded_this_month_dollars: toDollars(summary?.allocatedCents ?? 0),
+            carried_in_dollars: toDollars(summary?.carriedInCents ?? 0),
             spent_dollars: toDollars(summary?.spentCents ?? 0),
             balance_dollars: toDollars(summary?.balanceCents ?? 0),
+            rollover: e.rollover_mode,
             goal_date: e.target_date,
           };
         }),
@@ -188,6 +143,7 @@ const getSpendingPlan: AgentTool = {
 
 const listCategoriesTool: AgentTool = {
   mutates: false,
+  access: "read",
   definition: {
     name: "list_categories",
     description: "Every category in the household's taxonomy, with its kind (expense, income, savings, transfer) and whether it's archived.",
@@ -210,6 +166,7 @@ const listCategoriesTool: AgentTool = {
 
 const searchTransactions: AgentTool = {
   mutates: false,
+  access: "read",
   definition: {
     name: "search_transactions",
     description:
@@ -275,6 +232,7 @@ const searchTransactions: AgentTool = {
 
 const spendingSummary: AgentTool = {
   mutates: false,
+  access: "read",
   definition: {
     name: "spending_summary",
     description:
@@ -325,6 +283,7 @@ const spendingSummary: AgentTool = {
 
 const listAccountsTool: AgentTool = {
   mutates: false,
+  access: "read",
   definition: {
     name: "list_accounts",
     description: "The household's linked bank and credit card accounts with their latest known balances.",
@@ -347,6 +306,7 @@ const listAccountsTool: AgentTool = {
 
 const listRecurringBills: AgentTool = {
   mutates: false,
+  access: "read",
   definition: {
     name: "list_recurring_bills",
     description: "Recurring bills and income the app has detected or the household has confirmed, with how often each lands.",
@@ -372,6 +332,7 @@ const listRecurringBills: AgentTool = {
 
 const getOpenQuestions: AgentTool = {
   mutates: false,
+  access: "read",
   definition: {
     name: "get_open_questions",
     description:
@@ -406,6 +367,7 @@ const getOpenQuestions: AgentTool = {
 
 const categorizeTransactions: AgentTool = {
   mutates: true,
+  access: "categorize",
   definition: {
     name: "categorize_transactions",
     description:
@@ -446,6 +408,26 @@ const categorizeTransactions: AgentTool = {
         method: "human",
         createdByUserId: ctx.userId,
       });
+      ctx.record({
+        summary: `filed ${formatDollars(transaction.amount_cents)} at ${
+          transaction.normalized_merchant ?? transaction.raw_description
+        } under ${category.name}`,
+        undo: {
+          kind: "transactions",
+          entries: [
+            {
+              transactionId,
+              categoryId: transaction.category_id,
+              amountCents: transaction.amount_cents,
+              postedAt: transaction.posted_at,
+              payee: transaction.normalized_merchant,
+              memo: transaction.memo,
+              excluded: transaction.excluded_from_budget === 1,
+              flagColor: transaction.flag_color,
+            },
+          ],
+        },
+      });
 
       const clarification = await getLatestClarificationForTransaction(env.DB, ctx.householdId, transactionId);
       if (clarification && (clarification.status === "sent" || clarification.status === "queued")) {
@@ -465,10 +447,11 @@ const categorizeTransactions: AgentTool = {
 
 const updateSpendingPlan: AgentTool = {
   mutates: true,
+  access: "plan",
   definition: {
     name: "update_spending_plan",
     description:
-      "Change what an existing envelope plans for: its monthly target, the group it shows up under, or its goal date. Setting a goal date turns an envelope into a savings goal ('$5,000 for a trip by next June' = a target date plus the monthly target that gets there). Omit a field to leave it alone.",
+      "Change what an existing envelope plans for *every* month: its monthly target, the group it shows up under, its goal date, or whether leftover money rolls over. Setting a goal date turns an envelope into a savings goal ('$5,000 for a trip by next June' = a target date plus the monthly target that gets there). Omit a field to leave it alone. For a one-month-only change ('make groceries $250 this month'), use set_month_budget instead — this tool changes the plan from now on.",
     input_schema: {
       type: "object",
       properties: {
@@ -478,13 +461,18 @@ const updateSpendingPlan: AgentTool = {
         group: { type: "string", description: "The group it's shown under on the dashboard, e.g. 'Bills', 'Everyday', 'Goals'." },
         goal_date: { type: "string", description: "'YYYY-MM-DD' the goal should be funded by." },
         clear_goal_date: { type: "boolean", description: "True to drop the goal date, leaving a plain envelope." },
+        rollover: {
+          type: "string",
+          enum: ["carry", "reset"],
+          description: "'carry' leaves unspent money in the envelope next month (the default, right for goals and sinking funds). 'reset' starts every month at zero, for envelopes like groceries that shouldn't accumulate.",
+        },
       },
       required: ["category"],
     },
   },
   async run(env, ctx, input) {
     const { category, envelope } = await resolveEnvelope(env, ctx.householdId, required(input, "category"));
-    const patch: { groupName?: string; monthlyTargetCents?: number | null; targetDate?: string | null } = {};
+    const patch: { groupName?: string; monthlyTargetCents?: number | null; targetDate?: string | null; rolloverMode?: "carry" | "reset" } = {};
     const monthlyTarget = num(input, "monthly_target_dollars");
     if (bool(input, "clear_monthly_target")) patch.monthlyTargetCents = null;
     else if (monthlyTarget !== null) patch.monthlyTargetCents = toCents(monthlyTarget);
@@ -492,23 +480,35 @@ const updateSpendingPlan: AgentTool = {
     else if (str(input, "goal_date")) patch.targetDate = str(input, "goal_date");
     const group = str(input, "group");
     if (group) patch.groupName = group;
+    const rollover = str(input, "rollover");
+    if (rollover === "carry" || rollover === "reset") patch.rolloverMode = rollover;
+    else if (rollover !== null) throw new AgentToolError("'rollover' must be 'carry' or 'reset'");
 
+    const before = envelopeUndoEntry(envelope);
     const updated = await updateEnvelope(env.DB, ctx.householdId, envelope.id, patch);
+    ctx.record({
+      summary: `changed ${category.name}'s plan${
+        updated.monthly_target_cents === null ? " (no monthly target)" : ` to ${formatDollars(updated.monthly_target_cents)} a month`
+      }`,
+      undo: { kind: "envelope_fields", entries: [before] },
+    });
     return {
       category: category.name,
       group: updated.group_name,
       monthly_target_dollars: updated.monthly_target_cents === null ? null : toDollars(updated.monthly_target_cents),
       goal_date: updated.target_date,
+      rollover: updated.rollover_mode,
     };
   },
 };
 
 const createCategoryTool: AgentTool = {
   mutates: true,
+  access: "plan",
   definition: {
     name: "create_category",
     description:
-      "Add a new category to the spending plan. Expense and savings categories automatically get an envelope, so this is also how a new savings goal gets started. Check list_categories first — don't create a near-duplicate of one that already exists.",
+      "Add a new category to the spending plan. Expense and savings categories automatically get an envelope, so this is also how a new savings goal gets started. Check list_categories first, and ask the person before calling this — a new category is a change to how they see their money, and an existing one is usually what they meant.",
     input_schema: {
       type: "object",
       properties: {
@@ -517,6 +517,11 @@ const createCategoryTool: AgentTool = {
         group: { type: "string", description: "Dashboard group, e.g. 'Bills', 'Everyday', 'Goals'." },
         monthly_target_dollars: { type: "number" },
         goal_date: { type: "string", description: "'YYYY-MM-DD', for a savings goal with a deadline." },
+        rollover: {
+          type: "string",
+          enum: ["carry", "reset"],
+          description: "Whether leftover money carries into next month. Defaults to 'carry'.",
+        },
       },
       required: ["name", "kind"],
     },
@@ -532,6 +537,11 @@ const createCategoryTool: AgentTool = {
       throw new AgentToolError(`A category named '${name}' already exists — use update_spending_plan to change it instead.`);
     }
 
+    const rollover = str(input, "rollover");
+    if (rollover !== null && rollover !== "carry" && rollover !== "reset") {
+      throw new AgentToolError("'rollover' must be 'carry' or 'reset'");
+    }
+
     const category = await createCategory(env.DB, ctx.householdId, { name, kind });
     if (kind === "expense" || kind === "savings") {
       const monthlyTarget = num(input, "monthly_target_dollars");
@@ -539,14 +549,17 @@ const createCategoryTool: AgentTool = {
         groupName: str(input, "group") ?? (kind === "savings" ? "Goals" : "Uncategorized"),
         monthlyTargetCents: monthlyTarget === null ? null : toCents(monthlyTarget),
         targetDate: str(input, "goal_date"),
+        rolloverMode: rollover ?? "carry",
       });
     }
+    ctx.record({ summary: `created the ${category.name} category`, undo: { kind: "category_created", categoryId: category.id } });
     return { created: { category: category.name, kind: category.kind, category_id: category.id } };
   },
 };
 
 const renameCategoryTool: AgentTool = {
   mutates: true,
+  access: "plan",
   definition: {
     name: "rename_category",
     description: "Rename an existing category. Its history, envelope and balances all follow the rename.",
@@ -559,27 +572,46 @@ const renameCategoryTool: AgentTool = {
   async run(env, ctx, input) {
     const category = await resolveCategory(env, ctx.householdId, required(input, "category"));
     const renamed = await renameCategory(env.DB, ctx.householdId, category.id, required(input, "new_name"));
+    ctx.record({
+      summary: `renamed ${category.name} to ${renamed.name}`,
+      undo: { kind: "category_renamed", categoryId: category.id, name: category.name },
+    });
     return { renamed: { from: category.name, to: renamed.name } };
   },
 };
 
 const archiveCategoryTool: AgentTool = {
   mutates: true,
+  access: "destructive",
   definition: {
     name: "archive_category",
     description:
       "Retire a category (and its envelope) from the spending plan. Nothing is deleted — past transactions keep their history — it just stops being offered for new charges. Confirm with the person before calling this.",
-    input_schema: { type: "object", properties: { category: { type: "string" } }, required: ["category"] },
+    input_schema: {
+      type: "object",
+      properties: {
+        category: { type: "string" },
+        confirmed: { type: "boolean", description: "True only after the person has agreed to it in this conversation." },
+      },
+      required: ["category"],
+    },
   },
   async run(env, ctx, input) {
     const category = await resolveCategory(env, ctx.householdId, required(input, "category"));
+    requireConfirmation(input, `archiving ${category.name}`);
+    const wasArchived = category.archived_at !== null;
     await archiveCategory(env.DB, ctx.householdId, category.id);
+    ctx.record({
+      summary: `archived the ${category.name} category`,
+      undo: { kind: "category_archived", categoryId: category.id, wasArchived },
+    });
     return { archived: category.name };
   },
 };
 
 const moveMoney: AgentTool = {
   mutates: true,
+  access: "plan",
   definition: {
     name: "move_money",
     description:
@@ -603,14 +635,25 @@ const moveMoney: AgentTool = {
     const to = await resolveEnvelope(env, ctx.householdId, required(input, "to_category"));
     if (from.envelope.id === to.envelope.id) throw new AgentToolError("from_category and to_category are the same envelope");
 
-    const month = str(input, "month") ?? currentMonth();
+    const month = monthArg(input);
+    const amountCents = toCents(amount);
     await moveMoneyBetweenEnvelopes(env.DB, ctx.householdId, {
       fromEnvelopeId: from.envelope.id,
       toEnvelopeId: to.envelope.id,
       month,
-      amountCents: toCents(amount),
+      amountCents,
       note: str(input, "note"),
       createdByUserId: ctx.userId,
+    });
+    ctx.record({
+      summary: `moved ${formatDollars(amountCents)} from ${from.category.name} to ${to.category.name} for ${month}`,
+      undo: {
+        kind: "allocations",
+        entries: [
+          { envelopeId: from.envelope.id, month, amountCents: -amountCents },
+          { envelopeId: to.envelope.id, month, amountCents },
+        ],
+      },
     });
     return { moved_dollars: amount, from: from.category.name, to: to.category.name, month };
   },
@@ -618,6 +661,7 @@ const moveMoney: AgentTool = {
 
 const assignMoney: AgentTool = {
   mutates: true,
+  access: "plan",
   definition: {
     name: "assign_money",
     description:
@@ -637,13 +681,20 @@ const assignMoney: AgentTool = {
     const amount = num(input, "amount_dollars");
     if (amount === null || amount === 0) throw new AgentToolError("'amount_dollars' must be a non-zero number");
     const { category, envelope } = await resolveEnvelope(env, ctx.householdId, required(input, "category"));
-    const month = str(input, "month") ?? currentMonth();
+    const month = monthArg(input);
+    const amountCents = toCents(amount);
     await allocateToEnvelope(env.DB, ctx.householdId, {
       envelopeId: envelope.id,
       month,
-      amountCents: toCents(amount),
+      amountCents,
       note: str(input, "note"),
       createdByUserId: ctx.userId,
+    });
+    ctx.record({
+      summary: `${amountCents >= 0 ? "put" : "took"} ${formatDollars(amountCents)} ${
+        amountCents >= 0 ? "into" : "out of"
+      } ${category.name} for ${month}`,
+      undo: { kind: "allocations", entries: [{ envelopeId: envelope.id, month, amountCents }] },
     });
     return { assigned_dollars: amount, category: category.name, month };
   },
@@ -651,6 +702,7 @@ const assignMoney: AgentTool = {
 
 const setExcluded: AgentTool = {
   mutates: true,
+  access: "categorize",
   definition: {
     name: "set_transaction_excluded",
     description:
@@ -664,13 +716,35 @@ const setExcluded: AgentTool = {
   async run(env, ctx, input) {
     const excluded = bool(input, "excluded");
     if (excluded === null) throw new AgentToolError("'excluded' must be true or false");
+    const before = await getTransaction(env.DB, ctx.householdId, required(input, "transaction_id"));
     const transaction = await setTransactionExcluded(env.DB, ctx.householdId, required(input, "transaction_id"), excluded);
+    ctx.record({
+      summary: `${excluded ? "excluded" : "put back"} ${formatDollars(transaction.amount_cents)} at ${
+        transaction.normalized_merchant ?? transaction.raw_description
+      } ${excluded ? "from" : "into"} the budget`,
+      undo: {
+        kind: "transactions",
+        entries: [
+          {
+            transactionId: before.id,
+            categoryId: before.category_id,
+            amountCents: before.amount_cents,
+            postedAt: before.posted_at,
+            payee: before.normalized_merchant,
+            memo: before.memo,
+            excluded: before.excluded_from_budget === 1,
+            flagColor: before.flag_color,
+          },
+        ],
+      },
+    });
     return { transaction_id: transaction.id, merchant: transaction.normalized_merchant ?? transaction.raw_description, excluded };
   },
 };
 
 const rememberMerchant: AgentTool = {
   mutates: true,
+  access: "categorize",
   definition: {
     name: "always_categorize_merchant",
     description:
@@ -688,18 +762,27 @@ const rememberMerchant: AgentTool = {
     const merchant = required(input, "merchant_contains");
     const category = await resolveCategory(env, ctx.householdId, required(input, "category"));
     const conditions: Condition = { field: "merchant", op: "contains", value: merchant };
-    await createRule(env.DB, ctx.householdId, {
+    const rule = await createRule(env.DB, ctx.householdId, {
       conditions,
       actions: [{ type: "setCategory", categoryId: category.id }],
       source: "user",
     });
-    return { rule: `merchant contains '${merchant}' → ${category.name}` };
+    ctx.record({
+      summary: `made a rule: merchant contains '${merchant}' → ${category.name}`,
+      undo: { kind: "rule_created", ruleId: rule.id },
+    });
+    return { rule_id: rule.id, rule: `merchant contains '${merchant}' → ${category.name}` };
   },
 };
 
 // ---------------------------------------------------------------------------
+// The registry
+// ---------------------------------------------------------------------------
 
-const TOOLS: AgentTool[] = [
+/** The everyday tools: answering questions, and filing the charges a text
+ * is usually about. The rest of the household's budget is reachable
+ * through the grouped files imported below. */
+const CORE_TOOLS: AgentTool[] = [
   getSpendingPlan,
   listCategoriesTool,
   searchTransactions,
@@ -718,6 +801,8 @@ const TOOLS: AgentTool[] = [
   rememberMerchant,
 ];
 
+const TOOLS: AgentTool[] = [...CORE_TOOLS, ...PLAN_TOOLS, ...SERIES_TOOLS, ...TRANSACTION_TOOLS, ...UNDO_TOOLS];
+
 const TOOLS_BY_NAME = new Map(TOOLS.map((t) => [t.definition.name, t]));
 
 export const AGENT_TOOL_DEFINITIONS: Anthropic.Tool[] = TOOLS.map((t) => t.definition);
@@ -729,6 +814,9 @@ export function isMutatingTool(name: string): boolean {
 export interface AgentToolOutcome {
   content: string;
   isError: boolean;
+  /** The change-log rows this call wrote, newest last. The agent quotes
+   * these ids back when someone says "undo that". */
+  changeIds: string[];
 }
 
 /**
@@ -736,16 +824,55 @@ export interface AgentToolOutcome {
  * argument comes back as an is_error result the model reads and retries,
  * and an unexpected fault comes back the same way rather than killing the
  * turn — a half-answered text is worse than one that says what went wrong.
+ *
+ * Three things happen around the tool's own work:
+ *
+ *  - the caller's access_level is checked against what the tool does, so a
+ *    view-only member's "move $500 to gas" is refused here rather than
+ *    relying on the model to remember the rule;
+ *  - anything the tool recorded is written to agent_change_log, and the
+ *    resulting ids come back in the result so the model can offer, and
+ *    later perform, an undo;
+ *  - the recorded changes are dropped if the tool threw partway, since a
+ *    change that didn't finish has nothing to undo.
  */
 export async function runAgentTool(env: Env, ctx: AgentToolContext, name: string, input: unknown): Promise<AgentToolOutcome> {
   const tool = TOOLS_BY_NAME.get(name);
-  if (!tool) return { content: `No such tool '${name}'.`, isError: true };
+  if (!tool) return { content: `No such tool '${name}'.`, isError: true, changeIds: [] };
 
+  const accessLevel: AccessLevel = ctx.accessLevel ?? "full";
+  if (!accessLevelAllows(accessLevel, tool.access)) {
+    return { content: accessDeniedMessage(accessLevel, tool.access), isError: true, changeIds: [] };
+  }
+
+  const pending: ChangeRecord[] = [];
+  const runCtx: ToolRunContext = { ...ctx, accessLevel, record: (change) => pending.push(change) };
+
+  let result: unknown;
   try {
-    const result = await tool.run(env, ctx, (input ?? {}) as Record<string, unknown>);
-    return { content: JSON.stringify(result), isError: false };
+    result = await tool.run(env, runCtx, (input ?? {}) as Record<string, unknown>);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { content: message, isError: true };
+    return { content: message, isError: true, changeIds: [] };
   }
+
+  const changeIds: string[] = [];
+  for (const change of pending) {
+    try {
+      const entry = await recordChange(env.DB, ctx.householdId, {
+        userId: ctx.userId,
+        toolName: name,
+        summary: change.summary,
+        undo: change.undo,
+      });
+      changeIds.push(entry.id);
+    } catch (err) {
+      // The write itself succeeded; only the ability to undo it by text
+      // is lost. Saying so is better than failing a change that happened.
+      console.error(`[agentTools] ${name} succeeded but its undo record failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  const body = changeIds.length > 0 && result && typeof result === "object" ? { ...(result as object), change_ids: changeIds } : result;
+  return { content: JSON.stringify(body), isError: false, changeIds };
 }

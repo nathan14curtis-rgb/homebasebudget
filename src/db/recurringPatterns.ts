@@ -326,3 +326,19 @@ export async function matchRecurringPattern(db: D1Database, householdId: string,
   const match = results.find((p) => key.includes(p.merchant_pattern) && onSchedule(p, txn.posted_at));
   return match?.category_id ?? null;
 }
+
+/**
+ * Remove a series outright, along with the occurrences it projected.
+ * Distinct from ending it (which keeps matched history on the plan) and
+ * from dismissing a suggestion (which stops it being re-suggested) — this
+ * is for a series that should never have existed, which in practice means
+ * undoing one that was just created by mistake.
+ */
+export async function deleteRecurringPattern(db: D1Database, householdId: string, id: string): Promise<void> {
+  await db.prepare(`DELETE FROM series_occurrence WHERE pattern_id = ? AND household_id = ?`).bind(id, householdId).run();
+  await db.prepare(`DELETE FROM recurring_pattern WHERE id = ? AND household_id = ?`).bind(id, householdId).run();
+}
+
+export async function getRecurringPattern(db: D1Database, householdId: string, id: string): Promise<RecurringPattern | null> {
+  return db.prepare(`SELECT * FROM recurring_pattern WHERE id = ? AND household_id = ?`).bind(id, householdId).first<RecurringPattern>();
+}
