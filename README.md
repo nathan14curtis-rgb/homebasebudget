@@ -340,6 +340,9 @@ paths a bypass policy so Access lets them straight through:
 ```
 migrations/             D1 schema (wrangler d1 migrations)
 dashboard/               Vite/React SPA, built to dashboard/dist and served as Workers Assets (see wrangler.jsonc)
+  src/calendar.ts          Pure date + cash-projection math behind the Bills & Income calendar
+  src/useRecurring.ts      The household's recurring series, held once for the pages that share them
+  src/components/          One file per page, plus the dialog, schedule fields and row primitives they share
 src/
   types.ts              Domain types mirroring the schema
   lib/                  Framework-free helpers: money, ids, crypto, CSV, merchant normalization, secrets

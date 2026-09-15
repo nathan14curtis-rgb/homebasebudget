@@ -13,6 +13,7 @@ import {
   type User,
 } from "./api";
 import { ASSET_SUMMARY_VIEW, Sidebar, assetIdFromView } from "./components/Sidebar";
+import { BillsIncomePage } from "./components/BillsIncomePage";
 import { LoginPage } from "./components/LoginPage";
 import { OverviewPage } from "./components/OverviewPage";
 import { ChatPage } from "./components/ChatPage";
@@ -25,6 +26,9 @@ import { MaintenancePage } from "./components/MaintenancePage";
 import { AssetsPage } from "./components/AssetsPage";
 import { SettingsPage } from "./components/SettingsPage";
 import { getPageHead } from "./pageHeads";
+import { PageActionContext, type PageAction } from "./pageAction";
+import { useRecurring } from "./useRecurring";
+import { todayIso } from "./calendar";
 import { currentMonth, daysLeftInMonth } from "./format";
 
 const VIEW_STORAGE_KEY = "curtisclan.activeView";
@@ -47,13 +51,20 @@ export function App() {
   const [showCreateHousehold, setShowCreateHousehold] = useState(false);
   const [activeView, setActiveView] = useState(() => {
     const stored = localStorage.getItem(VIEW_STORAGE_KEY);
-    // The "Bills"/Recurring tab was removed — its content lives in
-    // Spending Plan (Envelopes) now, so a stale saved view falls back to
-    // Overview instead of landing on a route nothing renders.
-    return stored && stored !== "Bills" ? stored : "Overview";
+    // The old "Bills"/Recurring tab is gone; bills and income are a
+    // calendar of their own now, so a stale saved view lands there rather
+    // than on a route nothing renders.
+    if (stored === "Bills") return "BillsIncome";
+    return stored ?? "Overview";
   });
 
+  // The header's one action, registered by whichever page is mounted.
+  // Cleared on every view change so a stale page's action can never
+  // outlive it.
+  const [pageAction, setPageAction] = useState<PageAction | null>(null);
+
   function changeView(view: string) {
+    setPageAction(null);
     setActiveView(view);
     localStorage.setItem(VIEW_STORAGE_KEY, view);
   }
@@ -69,6 +80,10 @@ export function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [envelopeSummaries, setEnvelopeSummaries] = useState<Record<string, EnvelopeMonthSummary>>({});
+  // Recurring series and their projections, held once for both the Bills &
+  // Income calendar (which draws them) and the Spending Plan (which reads
+  // them to know which transactions to leave out).
+  const recurring = useRecurring(household?.id ?? null);
 
   // Household identity now comes from the session cookie (src/routes/auth.ts),
   // not a client-trusted localStorage id — a 401 here just means "not
@@ -149,6 +164,16 @@ export function App() {
     }
   }
 
+  /** The header action for a page that has an add form but no registered
+   * action of its own: scroll the form into view and put the cursor in its
+   * first field, which is what clicking "Add task" should do. */
+  function focusPageAddForm() {
+    const form = document.getElementById("page-add-form");
+    if (!form) return;
+    form.scrollIntoView({ behavior: "smooth", block: "center" });
+    form.querySelector<HTMLElement>("input, select, textarea")?.focus({ preventScroll: true });
+  }
+
   async function logout() {
     await api.logout().catch(() => {});
     setHousehold(null);
@@ -182,11 +207,20 @@ export function App() {
     for (const envelope of activeEnvelopes) {
       const summary = envelopeSummaries[envelope.id];
       const category = categoryById.get(envelope.category_id);
-      if (category?.kind === "expense" && envelope.monthly_target_cents) {
+      if (category?.kind === "expense" && envelope.monthly_target_cents && envelope.group_name.toLowerCase() !== "bills") {
         expenseSpent += summary?.spentCents ?? 0;
         expenseTarget += envelope.monthly_target_cents;
       }
-      if (summary && (summary.balanceCents < 0 || (envelope.monthly_target_cents && summary.spentCents >= envelope.monthly_target_cents * 0.85))) {
+      // Only an envelope with a planned amount can be close to blowing it,
+      // and a bill is not paced against a month at all — it is due on a day,
+      // and the calendar says so.
+      if (
+        summary &&
+        envelope.monthly_target_cents &&
+        envelope.group_name.toLowerCase() !== "bills" &&
+        category?.kind === "expense" &&
+        (summary.balanceCents < 0 || summary.spentCents >= envelope.monthly_target_cents * 0.85)
+      ) {
         needingAttention += 1;
       }
       if (category?.kind === "savings" && envelope.target_date) {
@@ -195,7 +229,11 @@ export function App() {
     }
     const assetIdInView = assetIdFromView(activeView);
     const asset = assetIdInView ? assets.find((a) => a.id === assetIdInView) : undefined;
+    const today = todayIso();
+    const stillToCome = (recurring.occurrencesByMonth[currentMonth()] ?? []).filter((o) => o.status === "upcoming");
     return {
+      upcomingBillCount: stillToCome.filter((o) => o.due_date >= today).length,
+      overdueBillCount: stillToCome.filter((o) => o.due_date < today).length,
       pctOfBudget: expenseTarget > 0 ? Math.round((expenseSpent / expenseTarget) * 100) : 0,
       uncategorizedCount: transactions.filter((t) => !t.category_id && !t.is_transfer).length,
       envelopesNeedingAttention: needingAttention,
@@ -203,7 +241,7 @@ export function App() {
       memberCount: users.length,
       assetName: asset?.name,
     };
-  }, [envelopes, envelopeSummaries, categoryById, transactions, users, activeView, assets]);
+  }, [envelopes, envelopeSummaries, categoryById, transactions, users, activeView, assets, recurring.occurrencesByMonth]);
 
   if (loading) return <p className="hint">Loading…</p>;
 
@@ -259,113 +297,137 @@ export function App() {
   const assetIdInView = assetIdFromView(activeView);
 
   return (
-    <div className="app-shell">
-      <Sidebar
-        activeView={activeView}
-        onChange={changeView}
-        assets={assets}
-        household={household}
-        memberCount={users.length}
-        monthStatus={{ daysLeft: daysLeftInMonth(), safeToSpendCents: Math.max(0, readyToAssignCents) }}
-        onOpenSettings={() => changeView("Settings")}
-        onLogout={logout}
-      />
+    <PageActionContext.Provider value={setPageAction}>
+      <div className="app-shell">
+        <Sidebar
+          activeView={activeView}
+          onChange={changeView}
+          assets={assets}
+          household={household}
+          memberCount={users.length}
+          monthStatus={{ daysLeft: daysLeftInMonth(), safeToSpendCents: Math.max(0, readyToAssignCents) }}
+          onOpenSettings={() => changeView("Settings")}
+          onLogout={logout}
+        />
 
-      <main className="main">
-        <header className="page-header">
-          <div className="page-header-text">
-            <span className="page-eyebrow">
-              {new Date().toLocaleDateString("en-US", { month: "long", year: "numeric" })} · {head.sectionLabel}
-            </span>
-            <h1 className="page-title">{head.title}</h1>
-            <p className="page-sub">{head.subtitle}</p>
-          </div>
-          {(head.secondaryCta || head.primaryCta) && (
-            <div className="page-actions">
-              {head.secondaryCta && <button className="secondary">{head.secondaryCta}</button>}
-              {head.primaryCta && <button>{head.primaryCta}</button>}
+        <main className="main">
+          <header className="page-header">
+            <div className="page-header-text">
+              <span className="page-eyebrow">
+                {new Date().toLocaleDateString("en-US", { month: "long", year: "numeric" })} · {head.sectionLabel}
+              </span>
+              <h1 className="page-title">{head.title}</h1>
+              <p className="page-sub">{head.subtitle}</p>
             </div>
-          )}
-        </header>
+            {/* One action, and only where the page actually has one. A page
+                with an add form but no registered action gets a button that
+                jumps to and focuses that form — a real action too, just a
+                cheaper one to wire. */}
+            {(pageAction || head.primaryCta) && (
+              <div className="page-actions">
+                <button type="button" onClick={pageAction ? pageAction.run : focusPageAddForm}>
+                  {pageAction?.label ?? head.primaryCta}
+                </button>
+              </div>
+            )}
+          </header>
 
-        {activeView === "Overview" && (
-          <OverviewPage
-            householdId={household.id}
-            categories={categories}
-            envelopes={envelopes}
-            envelopeSummaries={envelopeSummaries}
-            transactions={transactions}
-            onGoToTransactions={() => changeView("Transactions")}
-            onGoToEnvelopes={() => changeView("Envelopes")}
-          />
-        )}
-        {activeView === "Chat" && (
-          <ChatPage
-            householdId={household.id}
-            currentUserId={currentUserId}
-            // A turn can recategorize a charge or retarget an envelope —
-            // refresh the same data the other pages read so the change is
-            // visible without a reload.
-            onChanged={() => {
-              void refreshTransactions();
-              void refreshCategoriesAndEnvelopes();
-            }}
-          />
-        )}
-        {activeView === "Transactions" && (
-          <TransactionsPage
-            householdId={household.id}
-            currentUserId={currentUserId}
-            users={users}
-            accounts={accounts}
-            categories={categories}
-            transactions={transactions}
-            onChanged={refreshTransactions}
-          />
-        )}
-        {activeView === "Envelopes" && (
-          <EnvelopesPage
-            householdId={household.id}
-            accounts={accounts}
-            categories={categories}
-            envelopes={envelopes}
-            envelopeSummaries={envelopeSummaries}
-            transactions={transactions}
-            currentUserId={currentUserId}
-            onChanged={refreshCategoriesAndEnvelopes}
-            onTransactionsChanged={refreshTransactions}
-          />
-        )}
-        {activeView === "Goals" && (
-          <GoalsPage
-            householdId={household.id}
-            categories={categories}
-            envelopes={envelopes}
-            envelopeSummaries={envelopeSummaries}
-            onChanged={refreshCategoriesAndEnvelopes}
-          />
-        )}
-        {activeView === "Members" && (
-          <MembersPage householdId={household.id} users={users} accounts={accounts} transactions={transactions} onChanged={refreshUsers} />
-        )}
-        {documentCategory && <DocumentsPage householdId={household.id} category={documentCategory} users={users} assets={assets} />}
-        {maintenanceAssetType && <MaintenancePage householdId={household.id} assetType={maintenanceAssetType} assets={assets} />}
-        {(activeView === ASSET_SUMMARY_VIEW || assetIdInView) && (
-          <AssetsPage householdId={household.id} assets={assets} selectedAssetId={assetIdInView ?? undefined} onChanged={refreshAssets} />
-        )}
-        {activeView === "Settings" && (
-          <SettingsPage
-            householdId={household.id}
-            users={users}
-            accounts={accounts}
-            categories={categories}
-            onUsersChanged={refreshUsers}
-            onAccountsChanged={refreshAccounts}
-            onCategoriesChanged={refreshCategoriesAndEnvelopes}
-            onTransactionsChanged={refreshTransactions}
-          />
-        )}
-      </main>
-    </div>
+          {activeView === "Overview" && (
+            <OverviewPage
+              householdId={household.id}
+              categories={categories}
+              envelopes={envelopes}
+              envelopeSummaries={envelopeSummaries}
+              transactions={transactions}
+              recurring={recurring}
+              onGoToTransactions={() => changeView("Transactions")}
+              onGoToEnvelopes={() => changeView("Envelopes")}
+              onGoToBillsIncome={() => changeView("BillsIncome")}
+            />
+          )}
+          {activeView === "Chat" && (
+            <ChatPage
+              householdId={household.id}
+              currentUserId={currentUserId}
+              // A turn can recategorize a charge or retarget an envelope —
+              // refresh the same data the other pages read so the change is
+              // visible without a reload.
+              onChanged={() => {
+                void refreshTransactions();
+                void refreshCategoriesAndEnvelopes();
+              }}
+            />
+          )}
+          {activeView === "Transactions" && (
+            <TransactionsPage
+              householdId={household.id}
+              currentUserId={currentUserId}
+              users={users}
+              accounts={accounts}
+              categories={categories}
+              transactions={transactions}
+              onChanged={refreshTransactions}
+            />
+          )}
+          {activeView === "BillsIncome" && (
+            <BillsIncomePage
+              householdId={household.id}
+              accounts={accounts}
+              categories={categories}
+              envelopes={envelopes}
+              transactions={transactions}
+              currentUserId={currentUserId}
+              recurring={recurring}
+              onChanged={refreshCategoriesAndEnvelopes}
+              onTransactionsChanged={refreshTransactions}
+            />
+          )}
+          {activeView === "Envelopes" && (
+            <EnvelopesPage
+              householdId={household.id}
+              accounts={accounts}
+              categories={categories}
+              envelopes={envelopes}
+              envelopeSummaries={envelopeSummaries}
+              transactions={transactions}
+              currentUserId={currentUserId}
+              recurring={recurring}
+              onChanged={refreshCategoriesAndEnvelopes}
+              onTransactionsChanged={refreshTransactions}
+              onGoToBillsIncome={() => changeView("BillsIncome")}
+            />
+          )}
+          {activeView === "Goals" && (
+            <GoalsPage
+              householdId={household.id}
+              categories={categories}
+              envelopes={envelopes}
+              envelopeSummaries={envelopeSummaries}
+              onChanged={refreshCategoriesAndEnvelopes}
+            />
+          )}
+          {activeView === "Members" && (
+            <MembersPage householdId={household.id} users={users} accounts={accounts} transactions={transactions} onChanged={refreshUsers} />
+          )}
+          {documentCategory && <DocumentsPage householdId={household.id} category={documentCategory} users={users} assets={assets} />}
+          {maintenanceAssetType && <MaintenancePage householdId={household.id} assetType={maintenanceAssetType} assets={assets} />}
+          {(activeView === ASSET_SUMMARY_VIEW || assetIdInView) && (
+            <AssetsPage householdId={household.id} assets={assets} selectedAssetId={assetIdInView ?? undefined} onChanged={refreshAssets} />
+          )}
+          {activeView === "Settings" && (
+            <SettingsPage
+              householdId={household.id}
+              users={users}
+              accounts={accounts}
+              categories={categories}
+              onUsersChanged={refreshUsers}
+              onAccountsChanged={refreshAccounts}
+              onCategoriesChanged={refreshCategoriesAndEnvelopes}
+              onTransactionsChanged={refreshTransactions}
+            />
+          )}
+        </main>
+      </div>
+    </PageActionContext.Provider>
   );
 }

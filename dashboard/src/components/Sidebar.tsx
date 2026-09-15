@@ -2,16 +2,19 @@ import { useState } from "react";
 import type { Asset, Household } from "../api";
 import { formatCents } from "../format";
 
-export const BUDGETING_VIEWS = ["Overview", "Chat", "Transactions", "Envelopes", "Goals", "Members"] as const;
+export const BUDGETING_VIEWS = ["Overview", "Chat", "Transactions", "BillsIncome", "Envelopes", "Goals", "Members"] as const;
 // Internal view ids (above) stay the same — they're the persisted
 // localStorage value and App.tsx's routing key — only the label shown in
-// the nav changes per the rename: Envelopes -> Spending Plan. The former
-// "Bills"/Recurring tab is gone — its bill list, "Add recurring" wizard,
-// and detector now live inside Spending Plan's Bills section.
+// the nav changes per the rename: Envelopes -> Spending Plan. Money the
+// household has committed to (bills and paychecks) is a calendar of its
+// own, sitting before the Spending Plan in the nav because that is the
+// order the month actually happens in: what is owed is settled first,
+// and the plan spends what is left.
 const BUDGETING_LABELS: Record<(typeof BUDGETING_VIEWS)[number], string> = {
   Overview: "Overview",
   Chat: "Ask the bot",
   Transactions: "Transactions",
+  BillsIncome: "Bills & Income",
   Envelopes: "Spending Plan",
   Goals: "Goals",
   Members: "Members",
@@ -131,6 +134,9 @@ export function Sidebar({ activeView, onChange, assets, monthStatus, household, 
         </span>
       </div>
 
+      {/* Grouped so the two can sit side by side on a narrow screen, where
+          the sidebar is a strip across the top rather than a column. */}
+      <div className="sidebar-foot">
       <button className="household-footer" onClick={onOpenSettings} type="button">
         <span className="household-avatar">
           {household.name
@@ -145,13 +151,14 @@ export function Sidebar({ activeView, onChange, assets, monthStatus, household, 
         </span>
       </button>
       <button
-        className="secondary"
+        className="secondary sidebar-logout"
         type="button"
         onClick={onLogout}
         style={{ margin: "8px 12px 0", fontSize: 13, padding: "6px 10px" }}
       >
         Log out
       </button>
+      </div>
     </aside>
   );
 }

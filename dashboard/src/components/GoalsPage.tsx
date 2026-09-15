@@ -86,7 +86,7 @@ export function GoalsPage({ householdId, categories, envelopes, envelopeSummarie
         {goals.length === 0 && <p className="hint">No savings goals yet — add one below.</p>}
       </div>
 
-      <section className="card card--padded">
+      <section className="card card--padded" id="page-add-form">
         <h2>New goal</h2>
         <form onSubmit={addGoal}>
           <div className="row">

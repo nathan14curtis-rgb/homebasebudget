@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, type Account, type User } from "../api";
+import { Modal } from "./ScheduleFields";
 
 declare global {
   interface Window {
@@ -35,8 +36,14 @@ function loadPlaidScript(): Promise<void> {
   });
 }
 
-function statusLabel(status: Account["status"]): { text: string; className: string } {
-  if (status === "active") return { text: "connected", className: "pill ok" };
+function statusLabel(account: Account): { text: string; className: string } {
+  const { status } = account;
+  const isLinked = Boolean(account.plaid_item_id);
+  // "connected" is a claim about a bank link, so it is only made about an
+  // account that has one — a hand-added, CSV-only account is active too,
+  // and calling it connected was the kind of small lie that makes people
+  // stop trusting the rest of the page.
+  if (status === "active") return { text: isLinked ? "connected" : "manual", className: isLinked ? "pill ok" : "pill" };
   if (status === "login_required") return { text: "needs re-link", className: "pill warn" };
   return { text: status, className: "pill" };
 }
@@ -73,6 +80,8 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
   const [editName, setEditName] = useState("");
   const [editOwnerId, setEditOwnerId] = useState("");
   const [unlinkingId, setUnlinkingId] = useState<string | null>(null);
+  const [confirmingUnlink, setConfirmingUnlink] = useState<Account | null>(null);
+  const [alsoDeleteTransactions, setAlsoDeleteTransactions] = useState(false);
 
   function startEdit(a: Account) {
     setEditingId(a.id);
@@ -101,12 +110,13 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
     }
   }
 
-  async function unlink(a: Account) {
-    const label = `${a.name}${a.mask ? ` ····${a.mask}` : ""}`;
-    if (!window.confirm(`Unlink ${label} from Plaid? This stops syncing and can't be undone from here — you'd need to re-link it.`)) return;
-    const deleteTransactions = window.confirm(
-      `Also delete every transaction ${label} has ever synced? Choose OK if this was Sandbox test data. Choose Cancel to keep its history and just stop syncing.`,
-    );
+  /** Unlinking used to be two chained window.confirm()s, the second of
+   * which asked a destructive question ("delete every transaction?") whose
+   * answer was OK-or-Cancel — the same two buttons that had just meant
+   * yes-or-abort. One dialog, with the destructive part as an explicit
+   * opt-in checkbox, is both clearer and harder to do by accident. */
+  async function unlink(a: Account, deleteTransactions: boolean) {
+    setConfirmingUnlink(null);
     setUnlinkingId(a.id);
     setError(null);
     try {
@@ -181,7 +191,7 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
         {accounts
           .filter((a) => a.status !== "removed")
           .map((a) => {
-            const status = statusLabel(a.status);
+            const status = statusLabel(a);
             const owner = users.find((u) => u.id === a.owner_user_id);
             if (editingId === a.id) {
               return (
@@ -221,7 +231,14 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
                     Edit
                   </button>
                   {a.plaid_item_id ? (
-                    <button className="danger" onClick={() => unlink(a)} disabled={unlinkingId === a.id}>
+                    <button
+                      className="danger"
+                      onClick={() => {
+                        setAlsoDeleteTransactions(false);
+                        setConfirmingUnlink(a);
+                      }}
+                      disabled={unlinkingId === a.id}
+                    >
                       {unlinkingId === a.id ? "Unlinking…" : "Unlink"}
                     </button>
                   ) : (
@@ -278,6 +295,43 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
       </details>
 
       {error && <p className="error">{error}</p>}
+
+      {confirmingUnlink && (
+        <Modal
+          title={`Unlink ${confirmingUnlink.name}${confirmingUnlink.mask ? ` ····${confirmingUnlink.mask}` : ""}?`}
+          onClose={() => setConfirmingUnlink(null)}
+          width={460}
+          footer={
+            <>
+              <button type="button" className="secondary" onClick={() => setConfirmingUnlink(null)}>
+                Cancel
+              </button>
+              <button type="button" className="danger" onClick={() => void unlink(confirmingUnlink, alsoDeleteTransactions)}>
+                {alsoDeleteTransactions ? "Unlink and delete history" : "Unlink"}
+              </button>
+            </>
+          }
+        >
+          <p style={{ margin: 0, lineHeight: 1.55 }}>
+            Syncing stops. Re-connecting it later means going through your bank's login again.
+          </p>
+          <label className="row" style={{ gap: 8, alignItems: "flex-start" }}>
+            <input
+              type="checkbox"
+              data-autofocus="true"
+              checked={alsoDeleteTransactions}
+              onChange={(e) => setAlsoDeleteTransactions(e.target.checked)}
+              style={{ marginTop: 3 }}
+            />
+            <span>
+              Also delete every transaction it has ever synced.
+              <span className="hint" style={{ display: "block", margin: 0 }}>
+                For clearing out test data. Leave it unchecked to keep the history and only stop syncing.
+              </span>
+            </span>
+          </label>
+        </Modal>
+      )}
     </section>
   );
 }

@@ -67,13 +67,20 @@ const VERIFY_MARK: Record<VerifyState, { className: string; label: string; conte
 
 type QuickFilter = "out" | "in" | "needsCategory" | null;
 
+/** Two letters for the row's avatar. Statement descriptions are full of
+ * store numbers and punctuation ("SAFEWAY #1290", "SQ *THE BAKERY"), so
+ * words that start with neither a letter nor a digit are skipped rather
+ * than contributing a "#" or a "*" that identifies nothing. */
 function initials(text: string): string {
-  return text
-    .split(" ")
+  const letters = text
+    .split(/[\s\-_/]+/)
+    .map((word) => word.replace(/[^A-Za-z0-9]/g, ""))
+    .filter(Boolean)
     .slice(0, 2)
-    .map((w) => w[0])
+    .map((word) => word[0]!)
     .join("")
     .toUpperCase();
+  return letters || "?";
 }
 
 export function TransactionsPage({ householdId, currentUserId, users, accounts, categories, transactions, onChanged }: Props) {

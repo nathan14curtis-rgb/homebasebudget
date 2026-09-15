@@ -102,7 +102,7 @@ export function MaintenancePage({ householdId, assetType, assets }: Props) {
         )}
       </div>
 
-      <section className="card card--padded">
+      <section className="card card--padded" id="page-add-form">
         <h2>Add task</h2>
         <form onSubmit={addTask}>
           <div className="row">

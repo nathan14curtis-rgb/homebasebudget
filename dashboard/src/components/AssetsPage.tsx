@@ -143,7 +143,7 @@ export function AssetsPage({ householdId, assets, selectedAssetId, onChanged }: 
       </div>
 
       {!selectedAssetId && (
-        <section className="card card--padded">
+        <section className="card card--padded" id="page-add-form">
           <h2>Add asset</h2>
           <form onSubmit={addAsset}>
             <div className="row">

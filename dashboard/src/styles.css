@@ -25,6 +25,16 @@
   --gold: #e8a55a; /* warning/"tight" */
   --red: #c64545; /* danger/over-budget */
 
+  /* Money has a direction, and on the Bills & Income calendar it is the
+     only thing a square says at a glance: teal comes in, orange goes out.
+     The "soft" pair are the tinted fills a tile uses before anything has
+     posted against it; the solid ones fill it once something has. */
+  --teal-soft: #e2f1ed;
+  --orange: #d07c37;
+  --orange-soft: #f9eade;
+
+  --focus-ring: #141413;
+
   --radius-card: 12px;
   --radius-control: 8px;
   --radius-pill: 9999px;
@@ -301,6 +311,11 @@ h2 {
   flex-direction: column;
   gap: 48px;
   max-width: 1240px;
+  /* A grid item's default min-width is auto, which lets a wide child (the
+     four-across envelope grid, a long table) push the column past the
+     track and scroll the whole page sideways. Zero lets it shrink and the
+     child scroll or wrap instead. */
+  min-width: 0;
 }
 
 .page-header {
@@ -376,6 +391,10 @@ h2 {
 .card + .card {
   margin-top: 1.25rem;
 }
+/* A card is a box, and its contents should be able to shrink inside it. */
+.card {
+  min-width: 0;
+}
 .card--emphasis {
   background: var(--surface-emphasis);
   border: none;
@@ -384,20 +403,38 @@ h2 {
   padding: 32px;
 }
 
+/* auto-fit, not a fixed count: the same grid that wants four across on a
+   wide screen wants two on a laptop and one on a phone, and saying so once
+   here beats a media query per grid. minmax()'s 0 floor keeps a long word
+   or a wide table from blowing the track out. */
 .grid-2 {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
   gap: 24px;
 }
 .grid-3 {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   gap: 24px;
 }
 .grid-4 {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
   gap: 24px;
+}
+.grid-2 > *,
+.grid-3 > *,
+.grid-4 > * {
+  min-width: 0;
+}
+/* .card carries its own stacking margins for when it is used on its own.
+   Inside a grid the gap does that job, and the margins land on every cell
+   but the first — which is what pushed each card in a row a little lower
+   than the one before it. */
+.grid-2 > .card,
+.grid-3 > .card,
+.grid-4 > .card {
+  margin: 0;
 }
 
 .stat-tile {
@@ -1035,4 +1072,811 @@ details summary {
   font-size: 15px;
   font-weight: 600;
   color: var(--ink);
+}
+
+/* ==================================================================
+   Bills & Income calendar
+   ================================================================== */
+
+.calendar-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.calendar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.calendar-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.calendar-nav .row-edit-btn {
+  border-color: var(--border);
+  font-size: 20px;
+  line-height: 1;
+}
+.calendar-month {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 28px;
+  letter-spacing: -0.4px;
+  color: var(--ink);
+  min-width: 200px;
+}
+
+.calendar-grid {
+  display: flex;
+  flex-direction: column;
+}
+
+.calendar-weekdays,
+.calendar-week {
+  display: grid;
+  /* Seven equal days plus a narrow margin column for the week's net —
+     the running total belongs beside the week it totals, not under the
+     whole month where it would have to be matched back up by eye. */
+  grid-template-columns: repeat(7, minmax(0, 1fr)) 104px;
+}
+
+.calendar-weekdays {
+  background: var(--table-header);
+  border-bottom: 1px solid var(--divider);
+}
+.calendar-weekday {
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.calendar-weekday--net {
+  text-align: right;
+  border-left: 1px solid var(--divider);
+}
+.calendar-weekday-short {
+  display: none;
+}
+
+.calendar-week + .calendar-week .calendar-day,
+.calendar-week + .calendar-week .calendar-week-net {
+  border-top: 1px solid var(--divider);
+}
+
+.calendar-day {
+  position: relative;
+  min-height: 132px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-left: 1px solid var(--divider);
+}
+.calendar-day:first-child {
+  border-left: none;
+}
+.calendar-day--blank {
+  background: repeating-linear-gradient(135deg, transparent, transparent 7px, var(--hover) 7px, var(--hover) 8px);
+}
+.calendar-day.is-past {
+  background: rgba(232, 224, 210, 0.22);
+}
+.calendar-day.is-today {
+  /* inset, not a border: a border would shift the square's contents by a
+     pixel and make today's column visibly out of line with the rest. */
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+/* The square's empty space is the "add something here" target. It sits
+   *behind* the tiles (z-index 0 against their 1) rather than wrapping
+   them, because a button inside a button is invalid HTML and makes a
+   click on a tile open the add form instead of the tile. */
+.calendar-day-add {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.calendar-day-add:hover {
+  background: var(--hover);
+}
+.calendar-day-plus {
+  opacity: 0;
+  font-size: 22px;
+  line-height: 1;
+  color: var(--faint);
+  transition: opacity 120ms ease;
+}
+.calendar-day-add:hover .calendar-day-plus,
+.calendar-day-add:focus-visible .calendar-day-plus {
+  opacity: 1;
+}
+
+.calendar-day-number {
+  position: relative;
+  z-index: 1;
+  align-self: flex-start;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  pointer-events: none;
+}
+.calendar-day.is-today .calendar-day-number {
+  color: var(--accent);
+}
+
+.calendar-day-tiles {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.calendar-day-balance {
+  position: relative;
+  z-index: 1;
+  margin-top: auto;
+  padding-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  pointer-events: none;
+}
+.calendar-day-balance.is-negative {
+  color: var(--red);
+}
+
+/* The tile: amount first, name under it. The amount is what a calendar is
+   scanned for; the name is how you tell two of them apart. */
+.cal-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-left-width: 3px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: var(--font-body);
+  background: var(--surface-emphasis);
+  color: var(--ink);
+}
+.cal-tile-amount {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.cal-tile-name {
+  font-size: 11px;
+  line-height: 1.25;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cal-tile-check {
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.cal-tile--income {
+  background: var(--teal-soft);
+  border-color: var(--teal-soft);
+  border-left-color: var(--teal);
+}
+.cal-tile--income .cal-tile-amount {
+  color: #256c5e;
+}
+.cal-tile--income:hover {
+  border-color: var(--teal);
+}
+
+.cal-tile--bill {
+  background: var(--orange-soft);
+  border-color: var(--orange-soft);
+  border-left-color: var(--orange);
+}
+.cal-tile--bill .cal-tile-amount {
+  color: #93521c;
+}
+.cal-tile--bill:hover {
+  border-color: var(--orange);
+}
+
+/* Posted: filled rather than tinted. "Has it actually happened" is the
+   question a bill calendar gets asked most, so it is answered by the
+   single strongest visual difference available, not by a small icon. */
+.cal-tile--income.is-settled {
+  background: var(--teal);
+}
+.cal-tile--bill.is-settled {
+  background: var(--orange);
+}
+.cal-tile.is-settled,
+.cal-tile.is-settled .cal-tile-amount,
+.cal-tile.is-settled .cal-tile-name {
+  color: #ffffff;
+}
+
+.cal-tile.is-overdue {
+  border-color: var(--red);
+  border-left-color: var(--red);
+}
+.cal-tile.is-skipped {
+  background: var(--surface);
+  border-color: var(--border);
+  border-left-color: var(--faint);
+  opacity: 0.7;
+}
+.cal-tile.is-skipped .cal-tile-amount {
+  color: var(--faint);
+  text-decoration: line-through;
+}
+
+.calendar-week-net {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 12px;
+  border-left: 1px solid var(--divider);
+  background: var(--table-header);
+  font-size: 13px;
+  color: var(--muted);
+}
+.calendar-week-net-label {
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.calendar-week-net.is-positive .money {
+  color: var(--teal);
+}
+.calendar-week-net.is-negative .money {
+  color: var(--red);
+}
+
+.calendar-legend {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 14px 24px;
+  border-top: 1px solid var(--divider);
+  font-size: 12px;
+  color: var(--muted);
+}
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.legend-item--balance {
+  color: var(--faint);
+  flex: 1 1 260px;
+  min-width: 240px;
+  line-height: 1.5;
+}
+.legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border-left: 3px solid transparent;
+}
+.legend-swatch--income {
+  background: var(--teal-soft);
+  border-left-color: var(--teal);
+}
+.legend-swatch--bill {
+  background: var(--orange-soft);
+  border-left-color: var(--orange);
+}
+.legend-swatch--settled {
+  background: var(--orange);
+  border-left-color: var(--orange);
+}
+.legend-swatch--overdue {
+  background: var(--orange-soft);
+  border: 1px solid var(--red);
+  border-left: 3px solid var(--red);
+}
+
+/* ==================================================================
+   Shared controls introduced with the calendar
+   ================================================================== */
+
+/* Every focusable thing gets a visible ring. :focus-visible rather than
+   :focus so it appears for keyboard users without outlining a button
+   someone merely clicked. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-control);
+}
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+}
+
+/* A hover that still lights up on a disabled button reads as "this will
+   work if you click it", which is the one thing it must not say. */
+button:disabled:hover {
+  background: var(--accent);
+}
+button.secondary:disabled:hover {
+  background: var(--surface);
+}
+button.danger:disabled:hover {
+  background: transparent;
+  color: var(--red);
+}
+
+.link-button {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  font-size: 13px;
+  color: var(--accent);
+  cursor: pointer;
+  text-align: left;
+}
+.link-button:hover {
+  background: none;
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+.segmented {
+  display: inline-flex;
+  /* .field is a column flexbox, which would otherwise stretch this to the
+     full width and make the unselected half read as an empty text input. */
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  overflow: hidden;
+  background: var(--surface);
+}
+.segmented-option {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 8px 20px;
+  font-size: 14px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.segmented-option:hover:not(:disabled) {
+  background: var(--hover);
+}
+.segmented-option + .segmented-option {
+  border-left: 1px solid var(--border);
+}
+.segmented-option.is-selected {
+  color: var(--ink);
+  font-weight: 500;
+}
+.segmented-option--bill.is-selected {
+  background: var(--orange-soft);
+  box-shadow: inset 0 -2px 0 var(--orange);
+}
+.segmented-option--income.is-selected {
+  background: var(--teal-soft);
+  box-shadow: inset 0 -2px 0 var(--teal);
+}
+.segmented-option:disabled {
+  opacity: 1;
+  cursor: default;
+}
+.segmented-option:disabled:not(.is-selected) {
+  color: var(--faint);
+}
+
+/* A currency field that shows its unit, so "50" can't be read back as
+   fifty cents. */
+.input-prefix {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  overflow: hidden;
+}
+.input-prefix:focus-within {
+  border-color: var(--accent);
+}
+.input-prefix > span {
+  display: flex;
+  align-items: center;
+  padding: 0 4px 0 10px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+}
+.input-prefix > input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  font-family: var(--font-mono);
+}
+.input-prefix > input:focus {
+  outline: none;
+}
+
+.picked-value {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--hover);
+}
+.money-label {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.callout {
+  padding: 14px 16px;
+  border-radius: var(--radius-control);
+  background: var(--surface-emphasis);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--body-text);
+}
+.callout--danger {
+  background: #fbeceb;
+  border: 1px solid var(--red);
+}
+
+.rule {
+  border: none;
+  border-top: 1px solid var(--divider);
+  margin: 4px 0;
+  width: 100%;
+}
+
+.subhead {
+  margin: 0 0 2px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.section-head h2 {
+  margin: 0;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 48px 24px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-card);
+  text-align: center;
+  background: var(--surface);
+}
+.empty-state-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 22px;
+  color: var(--ink);
+}
+.empty-state .hint {
+  max-width: 44ch;
+}
+
+/* A row that is itself the control (a pick-one list), rather than a row
+   with a control somewhere in it. */
+.row-item--button {
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.row-item--button:hover {
+  background: var(--hover);
+}
+
+/* Modal chrome: a head and foot that stay put while the body scrolls, so
+   a long form's Save button is never below the fold. */
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--divider);
+  flex: 0 0 auto;
+}
+.modal-head h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 24px;
+  letter-spacing: -0.3px;
+  color: var(--ink);
+}
+.modal-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 2px;
+  margin: 0 -2px;
+}
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 12px;
+  border-top: 1px solid var(--divider);
+  flex: 0 0 auto;
+}
+
+/* ==================================================================
+   Narrow screens
+   ==================================================================
+   The app was laid out for a desktop window and nothing else: a fixed
+   248px sidebar column, fixed-count grids, and a calendar seven columns
+   wide. On a phone that meant a page you had to scroll sideways to read.
+   The grids above now reflow on their own; what is left is the shell, the
+   type scale, and the calendar. */
+
+@media (max-width: 1080px) {
+  .main {
+    padding: 32px 28px 56px;
+    gap: 36px;
+  }
+  .page-title {
+    font-size: 38px;
+  }
+  .section-title {
+    font-size: 28px;
+  }
+  /* The week's net has a column of its own only while there is room for
+     it; below this the week totals would squeeze the days that matter. */
+  .calendar-weekdays,
+  .calendar-week {
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+  .calendar-week-net,
+  .calendar-weekday--net {
+    display: none;
+  }
+}
+
+@media (max-width: 860px) {
+  /* The sidebar stops being a column and becomes a strip across the top,
+     scrolled horizontally if the nav is long. */
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    gap: 16px;
+    padding: 16px;
+  }
+  .sidebar .nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .sidebar .nav-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+  }
+  .sidebar .nav-group-header {
+    width: auto;
+    margin: 0;
+  }
+  .sidebar .nav-row {
+    width: auto;
+  }
+  /* "16 days left" is reference, not navigation. On a phone the whole
+     strip is overhead before any of the page shows, so it collapses to one
+     line and the household/log-out pair sits beside it rather than under
+     it — about 200px of every page's scroll, back. */
+  .month-status {
+    margin-top: 0;
+    padding: 10px 14px;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .month-status-label {
+    font-size: 11px;
+  }
+  .month-status-figure {
+    font-size: 16px;
+  }
+  .month-status-detail {
+    font-size: 13px;
+  }
+  .sidebar-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .household-footer {
+    padding-top: 8px;
+    flex: 1 1 auto;
+  }
+  .sidebar-logout {
+    margin: 8px 0 0 !important;
+    flex: 0 0 auto;
+  }
+
+  .main {
+    padding: 24px 16px 48px;
+    gap: 28px;
+  }
+  .page-header {
+    align-items: flex-start;
+  }
+  .page-title {
+    font-size: 32px;
+  }
+  .page-sub {
+    font-size: 16px;
+  }
+  .card--padded {
+    padding: 20px;
+  }
+
+  /* Seven columns cannot be honestly shrunk below about this width, so the
+     calendar scrolls inside its own card rather than the page scrolling
+     sideways underneath everything else. */
+  .calendar-grid {
+    overflow-x: auto;
+  }
+  .calendar-weekdays,
+  .calendar-week {
+    min-width: 660px;
+  }
+  .calendar-head {
+    padding: 16px;
+  }
+  .calendar-month {
+    font-size: 22px;
+    min-width: 0;
+  }
+  .calendar-legend {
+    padding: 12px 16px;
+    gap: 12px;
+  }
+
+  .row-item {
+    padding: 14px 16px;
+  }
+  .modal-overlay {
+    padding: 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  .calendar-weekday-long {
+    display: none;
+  }
+  .calendar-weekday-short {
+    display: inline;
+  }
+  .calendar-weekdays,
+  .calendar-week {
+    min-width: 620px;
+  }
+  .stat-tile .figure {
+    font-size: 34px;
+  }
+  /* A row of buttons that would otherwise run off the edge. */
+  .page-actions,
+  .modal-foot {
+    width: 100%;
+  }
+  .page-actions button,
+  .modal-foot button {
+    flex: 1 1 auto;
+  }
+}
+
+/* Someone who has asked for less motion should not get a smooth scroll or
+   a caret that swings. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+.pie-legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.pie-legend-chip:hover {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--ink);
+}
+.pie-legend-chip.is-active {
+  border-color: var(--border);
+  background: var(--hover);
+  color: var(--ink);
+}
+
+/* A three-across row of figures inside a card, where the page-level
+   grid-3's 260px columns would immediately wrap to one. */
+.grid-3--compact {
+  grid-template-columns: repeat(auto-fit, minmax(min(110px, 100%), 1fr));
+  gap: 16px;
 }
