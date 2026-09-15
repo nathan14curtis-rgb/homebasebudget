@@ -411,6 +411,9 @@ export const api = {
       categoryId?: string;
       newCategoryName?: string;
       monthlyTargetCents?: number;
+      // What the Bills & Income calendar shows on a tile before anything
+      // has posted against it. Falls back to monthlyTargetCents server-side.
+      expectedAmountCents?: number;
     } & RecurringPatternScheduleInput,
   ) => request<RecurringPattern>(`/households/${householdId}/recurring-patterns`, { method: "POST", body: JSON.stringify(input) }),
   updateRecurringPattern: (
@@ -425,6 +428,11 @@ export const api = {
     request<RecurringPattern>(`/households/${householdId}/recurring-patterns/${patternId}/confirm`, { method: "POST", body: JSON.stringify(input) }),
   dismissRecurringPattern: (householdId: string, patternId: string) =>
     request<{ ok: true }>(`/households/${householdId}/recurring-patterns/${patternId}/dismiss`, { method: "POST" }),
+  // Removes the series and every occurrence it projected — the calendar's
+  // "Delete", as opposed to "Stop after this month" (which PATCHes endedAt
+  // and leaves what already happened on the calendar).
+  deleteRecurringPattern: (householdId: string, patternId: string) =>
+    request<{ ok: true }>(`/households/${householdId}/recurring-patterns/${patternId}`, { method: "DELETE" }),
 
   createTransaction: (
     householdId: string,

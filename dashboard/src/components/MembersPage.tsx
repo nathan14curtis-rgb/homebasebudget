@@ -163,7 +163,7 @@ export function MembersPage({ householdId, users, accounts, transactions, onChan
         {users.length === 0 && <p className="hint">No members yet — invite one below.</p>}
       </div>
 
-      <section className="card card--padded">
+      <section className="card card--padded" id="page-add-form">
         <h2>Invite member</h2>
         <form onSubmit={inviteMember}>
           <div className="row">

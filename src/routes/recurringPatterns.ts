@@ -6,8 +6,10 @@ import type { RecurringPatternFrequency } from "../types";
 import {
   confirmRecurringPattern,
   createConfirmedRecurringPattern,
+  deleteRecurringPattern,
   detectRecurringPatterns,
   dismissRecurringPattern,
+  getRecurringPattern,
   listRecurringPatterns,
   updateRecurringPattern,
 } from "../db/recurringPatterns";
@@ -64,12 +66,16 @@ recurringPatternsRoute.post("/", async (c) => {
     categoryId?: string;
     newCategoryName?: string;
     monthlyTargetCents?: number;
+    expectedAmountCents?: number;
   }>();
 
   if (!body.merchantPattern?.trim()) return c.json({ error: "merchantPattern is required" }, 400);
   if (body.kind !== "expense" && body.kind !== "income") return c.json({ error: "kind must be 'expense' or 'income'" }, 400);
   const schedule = validateSchedule(body);
   if ("error" in schedule) return c.json({ error: schedule.error }, 400);
+  if (body.expectedAmountCents !== undefined && !Number.isInteger(body.expectedAmountCents)) {
+    return c.json({ error: "expectedAmountCents must be an integer number of cents" }, 400);
+  }
 
   let categoryId = body.categoryId;
   if (!categoryId) {
@@ -85,6 +91,10 @@ recurringPatternsRoute.post("/", async (c) => {
     categoryId,
     merchantPattern: body.merchantPattern,
     kind: body.kind,
+    // What the Bills & Income calendar projects a tile at before anything
+    // has posted. An expense also mirrors it onto its envelope's monthly
+    // target above; income has no envelope, so this is its only home.
+    expectedAmountCents: body.expectedAmountCents ?? body.monthlyTargetCents,
     frequency: schedule.frequency,
     dayOfMonth: body.dayOfMonth ?? 1,
     dayOfMonth2: body.dayOfMonth2,
@@ -167,6 +177,19 @@ recurringPatternsRoute.patch("/:patternId", async (c) => {
     dayTolerance: body.dayTolerance,
   });
   return c.json(pattern);
+});
+
+// Removing a series outright from the Bills & Income calendar — the
+// pattern and every occurrence it projected go away. Distinct from
+// /dismiss (which only stops a suggestion coming back) and from PATCHing
+// endedAt (which keeps matched history on the calendar).
+recurringPatternsRoute.delete("/:patternId", async (c) => {
+  const householdId = requireParam(c, "householdId");
+  const patternId = requireParam(c, "patternId");
+  const existing = await getRecurringPattern(c.env.DB, householdId, patternId);
+  if (!existing) return c.json({ error: "recurring pattern not found" }, 404);
+  await deleteRecurringPattern(c.env.DB, householdId, patternId);
+  return c.json({ ok: true });
 });
 
 recurringPatternsRoute.post("/:patternId/dismiss", async (c) => {

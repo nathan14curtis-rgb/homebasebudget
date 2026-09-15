@@ -1,5 +1,17 @@
 # Spending Plan editing — parity with Quicken Simplifi
 
+> **Superseded in part.** This plan assumed one page holding all four
+> sections — income, bills, planned and other spend. The Spending Plan is
+> now everyday, non-recurring spending only; income and bills moved to the
+> Bills & Income calendar (`dashboard/src/components/BillsIncomePage.tsx`),
+> where a series is a tile on the day it is due rather than a row in a
+> list. What the two pages share still holds and is still worth reading
+> here: series and their projected occurrences, the one-month override, the
+> included/excluded split, and the single transaction detail modal. What
+> does not: anything below describing Income or Bills *sections* of the
+> Spending Plan, and the per-row `⋮` menu's series actions, which are now
+> the calendar tile's dialog.
+
 Living plan for expanding what can be edited from the Spending Plan page
 (`dashboard/src/components/EnvelopesPage.tsx`). Written so the work can be
 picked up mid-flight: each phase is independently shippable, lands as its

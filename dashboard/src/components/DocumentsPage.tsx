@@ -92,8 +92,8 @@ export function DocumentsPage({ householdId, category, users, assets }: Props) {
         )}
       </div>
 
-      <section className="card card--padded">
-        <h2>Upload document</h2>
+      <section className="card card--padded" id="page-add-form">
+        <h2>Add document</h2>
         <form onSubmit={addDocument}>
           <div className="row">
             <input type="text" placeholder="Name" value={newName} onChange={(e) => setNewName(e.target.value)} required style={{ flex: 1 }} />

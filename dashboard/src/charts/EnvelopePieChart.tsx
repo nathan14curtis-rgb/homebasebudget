@@ -28,11 +28,17 @@ function pt(r: number, angle: number): [number, number] {
 /** Envelope-fill chart: a full circle represents the budget, and each
  * slice's radius (not just its angle) grows toward — and past, in red —
  * the outer guide ring to show how close to over budget it is. Slices
- * sharing a group get related shades of the same base color. Hover-only
- * detail strip below, no permanent legend, so the chart can be as large as
- * possible (per the design chat: added specifically to let it grow). */
+ * sharing a group get related shades of the same base color.
+ *
+ * Detail is shown for one slice at a time in a strip below, which keeps
+ * the chart itself as large as possible. It used to be reachable by hover
+ * alone — which is to say, not at all on a phone and not at all by
+ * keyboard — so a slice is now also focusable and clickable, and the
+ * legend beneath doubles as the touch target for each one. */
 export function EnvelopePieChart({ slices }: Props) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
+  const [pinnedIdx, setPinnedIdx] = useState<number | null>(null);
+  const shownIdx = hoveredIdx ?? pinnedIdx;
 
   const plannedTotal = slices.reduce((sum, s) => sum + s.plannedCents, 0);
   if (plannedTotal <= 0) {
@@ -75,8 +81,8 @@ export function EnvelopePieChart({ slices }: Props) {
     const [cx1, cy1] = pt(R, a1);
     const over = ratio > 1;
     const mid = (a0 + a1) / 2;
-    const hovered = hoveredIdx === i;
-    const dimmed = hoveredIdx != null && !hovered;
+    const hovered = shownIdx === i;
+    const dimmed = shownIdx != null && !hovered;
     const pop = hovered ? 6 : 0;
 
     return {
@@ -94,7 +100,7 @@ export function EnvelopePieChart({ slices }: Props) {
     };
   });
 
-  const hovered = hoveredIdx != null ? geometry[hoveredIdx] : undefined;
+  const hovered = shownIdx != null ? geometry[shownIdx] : undefined;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, flex: 1 }}>
@@ -109,8 +115,19 @@ export function EnvelopePieChart({ slices }: Props) {
                 stroke="#efe9de"
                 strokeWidth={1.5}
                 style={{ cursor: "pointer" }}
+                tabIndex={0}
+                role="button"
+                aria-label={`${g.slice.name}: ${formatCents(g.slice.spentCents)} of ${formatCents(g.slice.plannedCents)} spent`}
                 onMouseEnter={() => setHoveredIdx(i)}
                 onMouseLeave={() => setHoveredIdx(null)}
+                onFocus={() => setPinnedIdx(i)}
+                onClick={() => setPinnedIdx((prev) => (prev === i ? null : i))}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setPinnedIdx((prev) => (prev === i ? null : i));
+                  }
+                }}
               />
               <path d={g.capD} fill="none" stroke={g.capStroke} strokeWidth={1} />
             </g>
@@ -133,8 +150,27 @@ export function EnvelopePieChart({ slices }: Props) {
             </span>
           </>
         ) : (
-          <span style={{ fontSize: 13, color: "#8e8b82" }}>hover a slice for detail</span>
+          <span style={{ fontSize: 13, color: "#8e8b82" }}>Pick an envelope below, or a slice above.</span>
         )}
+      </div>
+
+      {/* The legend is also the control: on a touch screen there is no
+          hover, and without this the chart could not be read at all. */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center" }}>
+        {geometry.map((g, i) => (
+          <button
+            type="button"
+            key={g.slice.id}
+            className={`pie-legend-chip ${shownIdx === i ? "is-active" : ""}`}
+            aria-pressed={pinnedIdx === i}
+            onMouseEnter={() => setHoveredIdx(i)}
+            onMouseLeave={() => setHoveredIdx(null)}
+            onClick={() => setPinnedIdx((prev) => (prev === i ? null : i))}
+          >
+            <span aria-hidden style={{ width: 9, height: 9, borderRadius: 2, flex: "0 0 auto", background: g.fill }} />
+            {g.slice.name}
+          </button>
+        ))}
       </div>
     </div>
   );

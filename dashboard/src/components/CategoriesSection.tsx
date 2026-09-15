@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import { api, type Category } from "../api";
 
 interface Props {
@@ -15,11 +15,17 @@ const KIND_LABELS: Record<Category["kind"], string> = {
 };
 
 /**
- * Expense/savings categories (the envelopes) are managed on the Envelopes
- * and Bills pages, where the balance context they need actually lives.
- * This covers the rest: renaming any category, archiving/restoring, and
- * creating income/transfer categories — which have no envelope and so
- * don't belong on those pages.
+ * Every category the household has, grouped by kind.
+ *
+ * Spending and savings categories are normally managed where their money
+ * is — an envelope on the Spending Plan, a bill on the Bills & Income
+ * calendar — so this is the back of the drawer: rename anything, archive
+ * what is not used, restore what was, and create the income and transfer
+ * categories that have no envelope and so appear on neither page.
+ *
+ * Grouped rather than listed flat because a household starts with about
+ * forty seeded categories: one alphabetical run of forty rows is a wall,
+ * four labelled runs of ten are a list.
  */
 export function CategoriesSection({ householdId, categories, onChanged }: Props) {
   const [error, setError] = useState<string | null>(null);
@@ -29,7 +35,20 @@ export function CategoriesSection({ householdId, categories, onChanged }: Props)
   const [newName, setNewName] = useState("");
   const [newKind, setNewKind] = useState<Category["kind"]>("income");
 
-  const visible = categories.filter((c) => (showArchived ? c.archived_at : !c.archived_at));
+  const [search, setSearch] = useState("");
+
+  const groups = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    const visible = categories
+      .filter((c) => (showArchived ? c.archived_at : !c.archived_at))
+      .filter((c) => !needle || c.name.toLowerCase().includes(needle))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const order: Category["kind"][] = ["expense", "savings", "income", "transfer"];
+    return order
+      .map((kind) => ({ kind, items: visible.filter((c) => c.kind === kind) }))
+      .filter((g) => g.items.length > 0);
+  }, [categories, showArchived, search]);
+  const visibleCount = groups.reduce((sum, g) => sum + g.items.length, 0);
 
   async function rename(id: string) {
     setError(null);
@@ -68,15 +87,31 @@ export function CategoriesSection({ householdId, categories, onChanged }: Props)
   return (
     <section className="card">
       <h2>Categories</h2>
-      <p className="hint">Expense and savings categories (envelopes) are managed on the Envelopes and Bills pages. Income and transfer categories are here.</p>
+      <p className="hint">
+        Spending envelopes are set up on the Spending Plan and bills on the Bills &amp; Income calendar, where their money is. Everything
+        can be renamed or archived here.
+      </p>
 
-      <label className="row" style={{ gap: "0.35rem", marginBottom: "0.5rem" }}>
-        <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
-        <span>Show archived</span>
-      </label>
+      <div className="row" style={{ margin: "12px 0" }}>
+        <input
+          type="text"
+          aria-label="Search categories"
+          placeholder="Search categories…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          style={{ flex: 1, minWidth: 180 }}
+        />
+        <label className="row" style={{ gap: "0.35rem" }}>
+          <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+          <span>Show archived</span>
+        </label>
+      </div>
 
+      {groups.map((group) => (
+      <div key={group.kind}>
+      <p className="envelope-group-heading">{KIND_LABELS[group.kind]}</p>
       <ul className="list">
-        {visible.map((c) => (
+        {group.items.map((c) => (
           <li key={c.id}>
             {editingId === c.id ? (
               <span className="row" style={{ flex: 1 }}>
@@ -90,9 +125,7 @@ export function CategoriesSection({ householdId, categories, onChanged }: Props)
               </span>
             ) : (
               <>
-                <span>
-                  {c.name} <span className="pill">{KIND_LABELS[c.kind]}</span>
-                </span>
+                <span>{c.name}</span>
                 <span className="row">
                   <button
                     className="secondary"
@@ -111,12 +144,10 @@ export function CategoriesSection({ householdId, categories, onChanged }: Props)
             )}
           </li>
         ))}
-        {visible.length === 0 && (
-          <li>
-            <span className="hint">Nothing here.</span>
-          </li>
-        )}
       </ul>
+      </div>
+      ))}
+      {visibleCount === 0 && <p className="hint">{search.trim() ? `Nothing matching “${search.trim()}”.` : "Nothing here."}</p>}
 
       <form className="row" onSubmit={addCategory} style={{ marginTop: "0.75rem" }}>
         <input type="text" placeholder="Name" value={newName} onChange={(e) => setNewName(e.target.value)} required style={{ flex: 1 }} />

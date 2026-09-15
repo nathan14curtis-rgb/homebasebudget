@@ -10,6 +10,7 @@ import {
   type TransactionFlagColor,
 } from "../api";
 import { formatCents } from "../format";
+import { Modal } from "./ScheduleFields";
 
 const FLAG_COLORS: TransactionFlagColor[] = ["red", "orange", "yellow", "green", "blue", "purple"];
 
@@ -126,14 +127,6 @@ export function TransactionDetailModal({
       cancelled = true;
     };
   }, [householdId, transaction.id]);
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
 
   function toggleTag(tagId: string) {
     setTagIds((prev) => (prev === null ? [tagId] : prev.includes(tagId) ? prev.filter((id) => id !== tagId) : [...prev, tagId]));
@@ -258,15 +251,7 @@ export function TransactionDetailModal({
   };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-card" style={{ maxWidth: 560 }} onClick={(e) => e.stopPropagation()}>
-        <div className="row" style={{ justifyContent: "space-between" }}>
-          <h3 style={{ margin: 0 }}>Transaction detail</h3>
-          <button type="button" className="row-edit-btn" title="Close" onClick={onClose}>
-            ×
-          </button>
-        </div>
-
+    <Modal title="Transaction detail" onClose={onClose} width={560}>
         <p className="hint" style={{ margin: 0 }}>
           Appears on your {account?.name ?? "account"} statement as <strong>{transaction.raw_description}</strong>.
         </p>
@@ -498,140 +483,6 @@ export function TransactionDetailModal({
             </div>
           </div>
         </form>
-      </div>
-    </div>
-  );
-}
-
-/**
- * The same dialog in its reduced form, for an occurrence nothing has paid
- * yet — there is no transaction to edit, so what's editable is what the
- * occurrence itself owns: this month's amount, the day it's expected, and
- * whether it's happening at all.
- */
-export function OccurrenceDetailModal({
-  householdId,
-  occurrence,
-  pattern,
-  category,
-  onClose,
-  onSaved,
-}: {
-  householdId: string;
-  occurrence: SeriesOccurrence;
-  pattern: RecurringPattern | undefined;
-  category: Category | undefined;
-  onClose: () => void;
-  onSaved: () => Promise<void>;
-}) {
-  const projectedCents = occurrence.amount_override_cents ?? occurrence.amount_cents ?? pattern?.expected_amount_cents ?? null;
-  const [amount, setAmount] = useState(projectedCents === null ? "" : centsToInput(projectedCents));
-  const [dueDate, setDueDate] = useState(occurrence.due_date);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  async function save(e: FormEvent) {
-    e.preventDefault();
-    const trimmed = amount.trim();
-    const amountOverrideCents = trimmed === "" ? null : inputToCents(trimmed);
-    if (trimmed !== "" && amountOverrideCents === null) {
-      setError("Enter a valid amount, or clear it to fall back to the series");
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      await api.updateOccurrence(householdId, occurrence.id, { amountOverrideCents, dueDate });
-      await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save");
-      setSaving(false);
-    }
-  }
-
-  async function setStatus(status: "upcoming" | "skipped") {
-    setSaving(true);
-    setError(null);
-    try {
-      await api.updateOccurrence(householdId, occurrence.id, { status });
-      await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save");
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-        <div className="row" style={{ justifyContent: "space-between" }}>
-          <h3 style={{ margin: 0 }}>Upcoming {pattern?.kind === "income" ? "deposit" : "bill"}</h3>
-          <button type="button" className="row-edit-btn" title="Close" onClick={onClose}>
-            ×
-          </button>
-        </div>
-
-        <p className="hint" style={{ margin: 0 }}>
-          Projected from {pattern?.merchant_pattern ?? "a recurring series"}
-          {category ? ` · ${category.name}` : ""}. Nothing has posted for it yet, so there is no transaction to edit — these
-          changes apply to this occurrence only, never to the series.
-        </p>
-
-        <form className="section" style={{ gap: 12 }} onSubmit={save}>
-          <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
-            <div className="field" style={{ margin: 0 }}>
-              <label htmlFor="occ-amount">Amount this month</label>
-              <input
-                id="occ-amount"
-                type="number"
-                step="0.01"
-                placeholder="From the series"
-                value={amount}
-                disabled={saving}
-                onChange={(e) => setAmount(e.target.value)}
-                style={{ width: 160 }}
-              />
-            </div>
-            <div className="field" style={{ margin: 0 }}>
-              <label htmlFor="occ-due">Expected on</label>
-              <input id="occ-due" type="date" value={dueDate} disabled={saving} onChange={(e) => setDueDate(e.target.value)} />
-            </div>
-          </div>
-          <p className="hint" style={{ margin: 0 }}>Leave the amount blank to go back to whatever the series expects.</p>
-
-          {error && <p className="error" style={{ margin: 0 }}>{error}</p>}
-
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            {occurrence.status === "skipped" ? (
-              <button type="button" className="secondary" disabled={saving} onClick={() => setStatus("upcoming")}>
-                Un-skip
-              </button>
-            ) : (
-              <button type="button" className="secondary" disabled={saving} onClick={() => setStatus("skipped")}>
-                Skip this one
-              </button>
-            )}
-            <div className="row" style={{ gap: 8 }}>
-              <button type="button" className="secondary" disabled={saving} onClick={onClose}>
-                Cancel
-              </button>
-              <button type="submit" disabled={saving}>
-                {saving ? "Saving…" : "Update"}
-              </button>
-            </div>
-          </div>
-        </form>
-      </div>
-    </div>
+    </Modal>
   );
 }

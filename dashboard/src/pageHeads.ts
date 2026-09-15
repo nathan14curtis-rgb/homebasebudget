@@ -1,10 +1,15 @@
 /**
- * Per-view header copy — eyebrow section label, title, subtitle, and the
- * two header CTA labels — driven by real data instead of the design
- * mockup's hardcoded `heads` lookup table. See docs plan §6/§7: some CTAs
- * are wired to a real action, others stay inert placeholders (no backend
- * concept exists yet) — getPageHead only supplies the label; App.tsx and
- * each page component decide what a click actually does.
+ * Per-view header copy — eyebrow section label, title, and subtitle,
+ * driven by real data.
+ *
+ * The header used to carry a pair of CTA labels per page, most of which
+ * were inert: "Import last month", "Close the month", "Permissions",
+ * "Export report" and the rest were mockup copy with nothing behind them,
+ * and a button that does nothing when clicked is worse than no button at
+ * all. What is left is a single optional action per page, and it only
+ * exists where the page genuinely has one — App.tsx routes the click to
+ * whatever the page registered (see pageAction.ts), or, failing that, to
+ * the page's own add form.
  */
 
 export interface PageHeadContext {
@@ -14,13 +19,16 @@ export interface PageHeadContext {
   goalsCount: number;
   memberCount: number;
   assetName?: string; // set only when viewing a specific asset leaf
+  /** Bills and income due in the rest of this month, for the calendar's subtitle. */
+  upcomingBillCount: number;
+  overdueBillCount: number;
 }
 
 export interface PageHead {
   sectionLabel: string;
   title: string;
   subtitle: string;
-  secondaryCta: string;
+  /** Label for the header's one action, or "" for a page with none. */
   primaryCta: string;
 }
 
@@ -34,8 +42,7 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
         sectionLabel: "Overview",
         title: "Overview",
         subtitle: `The household is tracking ${ctx.pctOfBudget > 75 ? "a little hot" : "under plan"} this month.`,
-        secondaryCta: "Add expense",
-        primaryCta: "Close the month",
+        primaryCta: "",
       };
     case "Chat":
       return {
@@ -45,7 +52,6 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
           ctx.uncategorizedCount > 0
             ? `Ask anything about the budget, or tell it what to change. ${ctx.uncategorizedCount} charge${ctx.uncategorizedCount === 1 ? "" : "s"} still need a category.`
             : "Ask anything about the budget, or tell it what to change — same thread as your texts.",
-        secondaryCta: "",
         primaryCta: "",
       };
     case "Transactions":
@@ -56,11 +62,21 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
           ctx.uncategorizedCount > 0
             ? `${ctx.uncategorizedCount} transaction${ctx.uncategorizedCount === 1 ? "" : "s"} still need${ctx.uncategorizedCount === 1 ? "s" : ""} a category.`
             : "Every dollar has a home.",
-        // No header CTAs here on purpose — the page's own "Export CSV"
-        // button (tied to the current filters) is the only one; this pair
-        // was a second, inert copy plus a never-wired "Add expense".
-        secondaryCta: "",
+        // No header CTA here on purpose — the page's own "Export CSV"
+        // button is tied to the current filters, so it belongs beside them.
         primaryCta: "",
+      };
+    case "BillsIncome":
+      return {
+        sectionLabel: "Bills & Income",
+        title: "Bills & Income",
+        subtitle:
+          ctx.overdueBillCount > 0
+            ? `${ctx.overdueBillCount} bill${ctx.overdueBillCount === 1 ? "" : "s"} past due.`
+            : ctx.upcomingBillCount > 0
+              ? `${ctx.upcomingBillCount} still to come this month.`
+              : "Everything this month has landed.",
+        primaryCta: "Add bill or income",
       };
     case "Envelopes":
       return {
@@ -68,9 +84,8 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
         title: "Spending Plan",
         subtitle:
           ctx.envelopesNeedingAttention > 0
-            ? `${ctx.envelopesNeedingAttention} need${ctx.envelopesNeedingAttention === 1 ? "s" : ""} a nudge before the month closes.`
-            : "Every envelope is on track.",
-        secondaryCta: "Import last month",
+            ? `${ctx.envelopesNeedingAttention} envelope${ctx.envelopesNeedingAttention === 1 ? "" : "s"} need${ctx.envelopesNeedingAttention === 1 ? "s" : ""} a nudge before the month closes.`
+            : "Everyday spending, minus the bills that repeat.",
         primaryCta: "New envelope",
       };
     case "Goals":
@@ -78,15 +93,13 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
         sectionLabel: "Goals",
         title: "Goals",
         subtitle: `${ctx.goalsCount} thing${ctx.goalsCount === 1 ? "" : "s"} you're saving toward.`,
-        secondaryCta: "History",
         primaryCta: "New goal",
       };
     case "Members":
       return {
         sectionLabel: "Members",
         title: "Members",
-        subtitle: `${ctx.memberCount} people, shared ledger.`,
-        secondaryCta: "Permissions",
+        subtitle: `${ctx.memberCount} ${ctx.memberCount === 1 ? "person" : "people"}, one shared ledger.`,
         primaryCta: "Invite member",
       };
     case "Summary":
@@ -94,7 +107,6 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
         sectionLabel: "Assets · Summary",
         title: "Assets · Summary",
         subtitle: "Financial, document, and maintenance history merged per asset.",
-        secondaryCta: "Export report",
         primaryCta: "Add asset",
       };
     case "Settings":
@@ -102,7 +114,6 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
         sectionLabel: "Settings",
         title: "Settings",
         subtitle: "People, accounts, categories, and importing history.",
-        secondaryCta: "",
         primaryCta: "",
       };
   }
@@ -112,8 +123,7 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
       sectionLabel: `Documents · ${view}`,
       title: `Documents · ${view}`,
       subtitle: "Every document, in one place.",
-      secondaryCta: "Share access",
-      primaryCta: "Upload document",
+      primaryCta: "Add document",
     };
   }
 
@@ -122,7 +132,6 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
       sectionLabel: `Maintenance · ${view}`,
       title: `Maintenance · ${view}`,
       subtitle: view === "House" ? "What the house needs." : "Keep every car road-ready.",
-      secondaryCta: "Maintenance log",
       primaryCta: "Add task",
     };
   }
@@ -132,7 +141,6 @@ export function getPageHead(view: string, ctx: PageHeadContext): PageHead {
     sectionLabel: "Assets",
     title: ctx.assetName ?? view,
     subtitle: "Financial, document, and maintenance history for this asset.",
-    secondaryCta: "Export report",
-    primaryCta: "Edit asset",
+    primaryCta: "",
   };
 }

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, type Category, type Envelope, type EnvelopeMonthSummary, type Transaction } from "../api";
-import { formatCents } from "../format";
+import { formatCents, currentMonth } from "../format";
+import { occurrenceAmountCents, todayIso } from "../calendar";
+import type { Recurring } from "../useRecurring";
 import { envelopeStatus, STATUS_BADGE_CLASS } from "../envelopeStatus";
 import { PaceChart } from "../charts/PaceChart";
 import { EnvelopePieChart, type PieSliceInput } from "../charts/EnvelopePieChart";
@@ -11,8 +13,10 @@ interface Props {
   envelopes: Envelope[];
   envelopeSummaries: Record<string, EnvelopeMonthSummary>;
   transactions: Transaction[];
+  recurring: Recurring;
   onGoToTransactions: () => void;
   onGoToEnvelopes: () => void;
+  onGoToBillsIncome: () => void;
 }
 
 function monthRange() {
@@ -23,7 +27,17 @@ function monthRange() {
   return { fromDate: iso(start), toDate: iso(end), daysInMonth: end.getDate(), dayOfMonth: now.getDate() };
 }
 
-export function OverviewPage({ householdId, categories, envelopes, envelopeSummaries, transactions, onGoToTransactions, onGoToEnvelopes }: Props) {
+export function OverviewPage({
+  householdId,
+  categories,
+  envelopes,
+  envelopeSummaries,
+  transactions,
+  recurring,
+  onGoToTransactions,
+  onGoToEnvelopes,
+  onGoToBillsIncome,
+}: Props) {
   const [monthTransactions, setMonthTransactions] = useState<Transaction[]>([]);
   const categoryById = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
   const activeEnvelopes = useMemo(() => envelopes.filter((e) => !e.archived_at), [envelopes]);
@@ -39,8 +53,15 @@ export function OverviewPage({ householdId, categories, envelopes, envelopeSumma
     };
   }, [householdId]);
 
+  // Everyday spending only. A bill isn't paced against a month — it is due
+  // on a day, and the Bills & Income calendar is where it is read — so
+  // mixing bills into "spent so far of planned" made the one number this
+  // page leads with answer a question nobody was asking.
   const expenseEnvelopes = useMemo(
-    () => activeEnvelopes.filter((e) => categoryById.get(e.category_id)?.kind === "expense" && e.monthly_target_cents),
+    () =>
+      activeEnvelopes.filter(
+        (e) => categoryById.get(e.category_id)?.kind === "expense" && e.monthly_target_cents && e.group_name.toLowerCase() !== "bills",
+      ),
     [activeEnvelopes, categoryById],
   );
   const budgetCents = useMemo(() => expenseEnvelopes.reduce((sum, e) => sum + (e.monthly_target_cents ?? 0), 0), [expenseEnvelopes]);
@@ -77,13 +98,43 @@ export function OverviewPage({ householdId, categories, envelopes, envelopeSumma
         .reduce((sum, t) => sum + t.amount_cents, 0),
     [monthTransactions, categoryById],
   );
-  const fixedBillsCents = useMemo(
-    () =>
-      activeEnvelopes
-        .filter((e) => e.group_name.toLowerCase() === "bills")
-        .reduce((sum, e) => sum + (envelopeSummaries[e.id]?.spentCents ?? 0), 0),
-    [activeEnvelopes, envelopeSummaries],
-  );
+  /** This month as the Bills & Income calendar has it: what is committed,
+   * how much of it has actually moved, and what is next. */
+  const billsAndIncome = useMemo(() => {
+    const today = todayIso();
+    const occurrences = recurring.occurrencesByMonth[currentMonth()] ?? [];
+    const patternById = new Map(recurring.patterns.map((p) => [p.id, p]));
+    let billsTotal = 0;
+    let billsPaid = 0;
+    let incomeTotal = 0;
+    let incomeReceived = 0;
+    let overdue = 0;
+    const upcoming: { name: string; dueDate: string; amountCents: number | null; isIncome: boolean }[] = [];
+    for (const o of occurrences) {
+      if (o.status === "skipped") continue;
+      const p = patternById.get(o.pattern_id);
+      const amount = occurrenceAmountCents(o, p) ?? 0;
+      const isIncome = p?.kind === "income";
+      if (isIncome) {
+        incomeTotal += amount;
+        if (o.status === "matched") incomeReceived += amount;
+      } else {
+        billsTotal += amount;
+        if (o.status === "matched") billsPaid += amount;
+      }
+      if (o.status === "upcoming") {
+        if (o.due_date < today) overdue += 1;
+        upcoming.push({
+          name: categoryById.get(p?.category_id ?? "")?.name ?? p?.merchant_pattern ?? "Untitled",
+          dueDate: o.due_date,
+          amountCents: occurrenceAmountCents(o, p),
+          isIncome,
+        });
+      }
+    }
+    upcoming.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+    return { billsTotal, billsPaid, incomeTotal, incomeReceived, overdue, upcoming: upcoming.slice(0, 4) };
+  }, [recurring.occurrencesByMonth, recurring.patterns, categoryById]);
   const savedCents = useMemo(
     () =>
       activeEnvelopes
@@ -108,7 +159,18 @@ export function OverviewPage({ householdId, categories, envelopes, envelopeSumma
     }));
   }, [expenseEnvelopes, categoryById, envelopeSummaries, monthTransactions]);
 
-  const envelopeCards = useMemo(() => activeEnvelopes.filter((e) => e.monthly_target_cents), [activeEnvelopes]);
+  const envelopeCards = useMemo(
+    () =>
+      activeEnvelopes
+        .filter((e) => e.monthly_target_cents && e.group_name.toLowerCase() !== "bills" && categoryById.get(e.category_id)?.kind === "expense")
+        // Tightest first: the envelope about to run out is the one worth
+        // seeing without scrolling.
+        .sort((a, b) => {
+          const left = (s: EnvelopeMonthSummary | undefined, e: Envelope) => (s ? s.balanceCents / (e.monthly_target_cents || 1) : 1);
+          return left(envelopeSummaries[a.id], a) - left(envelopeSummaries[b.id], b);
+        }),
+    [activeEnvelopes, categoryById, envelopeSummaries],
+  );
 
   // Income & expense summary (a lightweight P&L for the month) — replaces
   // "Recent activity" per request: a running feed of the last few
@@ -158,14 +220,14 @@ export function OverviewPage({ householdId, categories, envelopes, envelopeSumma
             <span style={{ fontSize: 16, color: "var(--muted)", paddingBottom: 8 }}>of {formatCents(budgetCents)} planned</span>
           </div>
           <PaceChart dailyCumulativeCents={dailyCumulativeCents} budgetCents={budgetCents} daysInMonth={daysInMonth} />
-          <div className="grid-3" style={{ borderTop: "1px solid var(--track)", paddingTop: 24 }}>
+          <div className="grid-3 grid-3--compact" style={{ borderTop: "1px solid var(--track)", paddingTop: 24 }}>
             <div className="stat-tile">
               <span className="label">Income</span>
               <span className="figure figure--small">{formatCents(incomeCents)}</span>
             </div>
             <div className="stat-tile">
-              <span className="label">Fixed bills</span>
-              <span className="figure figure--small">{formatCents(fixedBillsCents)}</span>
+              <span className="label">Bills</span>
+              <span className="figure figure--small">{formatCents(billsAndIncome.billsTotal)}</span>
             </div>
             <div className="stat-tile">
               <span className="label">Saved</span>
@@ -184,9 +246,62 @@ export function OverviewPage({ householdId, categories, envelopes, envelopeSumma
         </div>
       </section>
 
+      {/* What is committed before a dollar of everyday spending — the
+          calendar's own figures, summarised, with a way through to it. */}
+      <section className="section" style={{ gap: 16 }}>
+        <div className="section-header">
+          <h2 className="section-title">Bills &amp; income</h2>
+          <a href="#" onClick={(e) => (e.preventDefault(), onGoToBillsIncome())}>
+            Open the calendar
+          </a>
+        </div>
+        <div className="grid-2" style={{ alignItems: "stretch" }}>
+          <div className="card card--padded" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            <div className="grid-2" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(160px, 100%), 1fr))" }}>
+              <div className="stat-tile">
+                <span className="label">Income expected</span>
+                <span className="figure figure--small money positive">{formatCents(billsAndIncome.incomeTotal)}</span>
+                <span className="detail">{formatCents(billsAndIncome.incomeReceived)} received so far.</span>
+              </div>
+              <div className="stat-tile">
+                <span className="label">Bills committed</span>
+                <span className="figure figure--small money">{formatCents(billsAndIncome.billsTotal)}</span>
+                <span className="detail">{formatCents(billsAndIncome.billsPaid)} paid so far.</span>
+              </div>
+            </div>
+            {billsAndIncome.overdue > 0 && (
+              <p className="callout callout--danger" style={{ margin: 0 }}>
+                {billsAndIncome.overdue} bill{billsAndIncome.overdue === 1 ? " is" : "s are"} past due.
+              </p>
+            )}
+          </div>
+
+          <div className="card card--padded" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <span className="label">Next up</span>
+            {billsAndIncome.upcoming.length === 0 ? (
+              <span className="hint">Everything this month has landed.</span>
+            ) : (
+              <ul className="list">
+                {billsAndIncome.upcoming.map((u) => (
+                  <li key={`${u.name}-${u.dueDate}`}>
+                    <span className="row-figure">
+                      <span className="row-title">{u.name}</span>
+                      <span className="row-meta">{u.dueDate}</span>
+                    </span>
+                    <span className={`money ${u.isIncome ? "positive" : ""}`}>
+                      {u.amountCents === null ? "—" : `${u.isIncome ? "+" : "−"}${formatCents(u.amountCents)}`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      </section>
+
       <section className="section">
         <div className="section-header">
-          <h2 className="section-title">Envelopes</h2>
+          <h2 className="section-title">Everyday envelopes</h2>
           <a href="#" onClick={(e) => (e.preventDefault(), onGoToEnvelopes())}>
             Adjust allocations
           </a>
@@ -217,14 +332,14 @@ export function OverviewPage({ householdId, categories, envelopes, envelopeSumma
               </div>
             );
           })}
-          {envelopeCards.length === 0 && <p className="hint">No budgeted envelopes yet.</p>}
+          {envelopeCards.length === 0 && <p className="hint">No everyday envelopes with an amount planned yet.</p>}
         </div>
       </section>
 
       <section className="grid-2" style={{ gridTemplateColumns: "1.4fr 1fr", alignItems: "start" }}>
         <div className="section">
           <h2 className="section-title">Income &amp; expense summary</h2>
-          <div className="grid-3">
+          <div className="grid-3 grid-3--compact">
             <div className="stat-tile">
               <span className="label">Income</span>
               <span className="figure figure--small" style={{ color: "var(--teal)" }}>
