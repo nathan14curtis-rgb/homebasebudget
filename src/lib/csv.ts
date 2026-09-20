@@ -65,3 +65,16 @@ export function parseCsvWithHeader(text: string): Array<Record<string, string>> 
     return record;
   });
 }
+
+/** Quote a cell only when RFC 4180 says it needs it: a comma, a quote, or
+ * a line break inside. Everything else is written bare so the file stays
+ * readable in a text editor as well as a spreadsheet. */
+export function csvCell(value: string | number | null | undefined): string {
+  const text = value === null || value === undefined ? "" : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/** Header row plus data rows, CRLF-terminated the way spreadsheets expect. */
+export function formatCsv(header: string[], rows: Array<Array<string | number | null | undefined>>): string {
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+}

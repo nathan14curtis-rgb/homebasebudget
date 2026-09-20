@@ -88,14 +88,18 @@ export function weeksInMonth(month: string): CalendarDay[][] {
   return weeks;
 }
 
-/** What an occurrence is worth, as a magnitude. An override set by hand
- * for this month wins, then whatever was captured when it was generated
- * (which reconciliation replaces with the real amount once a transaction
- * posts), then the series' standing expectation. Null means "no figure
- * yet" — the tile shows a dash, never $0.00, which would read as a real
- * zero-dollar bill. */
+/** What an occurrence is worth, as a magnitude. Once a transaction has
+ * posted against it, what it actually cost is the answer. Before that, an
+ * override set by hand for this month wins, then whatever was captured
+ * when it was generated, then the series' standing expectation. Null
+ * means "no figure yet" — the tile shows a dash, never $0.00, which would
+ * read as a real zero-dollar bill. Mirrors resolveOccurrenceAmountCents
+ * in src/envelopes/occurrences.ts. */
 export function occurrenceAmountCents(occurrence: SeriesOccurrence, pattern: RecurringPattern | undefined): number | null {
-  const magnitude = occurrence.amount_override_cents ?? occurrence.amount_cents ?? pattern?.expected_amount_cents ?? null;
+  const magnitude =
+    occurrence.status === "matched" && occurrence.amount_cents !== null
+      ? occurrence.amount_cents
+      : (occurrence.amount_override_cents ?? occurrence.amount_cents ?? pattern?.expected_amount_cents ?? null);
   return magnitude === null ? null : Math.abs(magnitude);
 }
 
@@ -127,9 +131,17 @@ export function cashOnHandCents(accounts: Account[]): number {
  * monthly figure — a $12,000 car fund is not $400 a day of spending, and
  * including it made the projected balance fall off a cliff.
  */
-export function perDiemCents(envelopes: Envelope[], categoryById: Map<string, Category>, month: string): number {
+export function perDiemCents(envelopes: Envelope[], categoryById: Map<string, Category>, month: string, billCategoryIds: Set<string> = new Set()): number {
   const plannedCents = envelopes
-    .filter((e) => !e.archived_at && e.group_name.toLowerCase() !== "bills" && categoryById.get(e.category_id)?.kind === "expense")
+    .filter(
+      (e) =>
+        !e.archived_at &&
+        e.group_name.toLowerCase() !== "bills" &&
+        // A category with a series is a bill whatever its envelope is
+        // grouped as (older bills were added without regrouping it).
+        !billCategoryIds.has(e.category_id) &&
+        categoryById.get(e.category_id)?.kind === "expense",
+    )
     .reduce((sum, e) => sum + (e.monthly_target_cents ?? 0), 0);
   return Math.round(plannedCents / daysInMonth(month));
 }

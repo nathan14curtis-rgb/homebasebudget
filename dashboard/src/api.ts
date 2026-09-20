@@ -6,7 +6,10 @@
 
 export class ApiError extends Error {
   constructor(public status: number, public body: unknown) {
-    super(`API error ${status}: ${JSON.stringify(body)}`);
+    // The Worker's routes answer with { error: "…" } written for a person;
+    // show that, and fall back to the raw status only when there isn't one.
+    const message = body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string" ? (body as { error: string }).error : null;
+    super(message ?? `API error ${status}: ${JSON.stringify(body)}`);
   }
 }
 
@@ -213,6 +216,29 @@ export interface CategorySuggestion {
   reasoning: string;
 }
 
+export type BudgetRowType = "envelope" | "goal" | "bill" | "income";
+export type BudgetPlanAction = "create" | "update" | "archive" | "unchanged" | "error";
+
+/** One row of an uploaded budget CSV and what applying it would do
+ * (src/budget/csv.ts). */
+export interface BudgetPlanRow {
+  line: number;
+  type: BudgetRowType | null;
+  name: string;
+  action: BudgetPlanAction;
+  changes: string[];
+  error?: string;
+}
+
+export interface BudgetPlanSummary {
+  rows: BudgetPlanRow[];
+  creates: number;
+  updates: number;
+  archives: number;
+  errors: number;
+  applied: boolean;
+}
+
 export interface MaintenanceTask {
   id: string;
   household_id: string;
@@ -297,6 +323,25 @@ export const api = {
     request<Record<string, EnvelopeMonthSummary>>(`/households/${householdId}/envelopes/summary?month=${month}`),
   allocateToEnvelope: (householdId: string, envelopeId: string, input: { month: string; amountCents: number; note?: string }) =>
     request<{ ok: true }>(`/households/${householdId}/envelopes/${envelopeId}/allocate`, { method: "POST", body: JSON.stringify(input) }),
+  // Bring envelopes up to their monthly targets for the month, all of them
+  // or just the ids given — the dashboard's counterpart to the texting
+  // agent's "fund the month from the plan".
+  fundEnvelopes: (householdId: string, input: { month: string; envelopeIds?: string[]; topUpOnly?: boolean }) =>
+    request<{ funded: Array<{ envelopeId: string; month: string; amountCents: number; availableAfterCents: number }>; totalCents: number }>(
+      `/households/${householdId}/envelopes/fund`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+
+  // The whole plan as a spreadsheet, and the way back (src/budget/csv.ts).
+  downloadBudgetCsv: async (householdId: string) => {
+    const response = await fetch(`/api/households/${householdId}/budget/csv`);
+    if (!response.ok) throw new ApiError(response.status, await response.json().catch(() => null));
+    return response.text();
+  },
+  previewBudgetCsv: (householdId: string, csv: string) =>
+    request<BudgetPlanSummary>(`/households/${householdId}/budget/csv`, { method: "POST", body: JSON.stringify({ csv, apply: false }) }),
+  applyBudgetCsv: (householdId: string, csv: string) =>
+    request<BudgetPlanSummary>(`/households/${householdId}/budget/csv`, { method: "POST", body: JSON.stringify({ csv, apply: true }) }),
   moveMoneyBetweenEnvelopes: (
     householdId: string,
     input: { fromEnvelopeId: string; toEnvelopeId: string; month: string; amountCents: number; note?: string },
@@ -424,8 +469,19 @@ export const api = {
     request<RecurringPattern>(`/households/${householdId}/recurring-patterns/${patternId}`, { method: "PATCH", body: JSON.stringify(input) }),
   detectRecurringPatterns: (householdId: string) =>
     request<RecurringPattern[]>(`/households/${householdId}/recurring-patterns/detect`, { method: "POST" }),
-  confirmRecurringPattern: (householdId: string, patternId: string, input: { categoryId?: string; newCategoryName?: string; kind?: "expense" | "income" }) =>
-    request<RecurringPattern>(`/households/${householdId}/recurring-patterns/${patternId}/confirm`, { method: "POST", body: JSON.stringify(input) }),
+  // Puts a detected series on the calendar. Takes the amount, schedule and
+  // merchant corrected in the same dialog so it is one request, not two.
+  confirmRecurringPattern: (
+    householdId: string,
+    patternId: string,
+    input: {
+      categoryId?: string;
+      newCategoryName?: string;
+      kind?: "expense" | "income";
+      merchantPattern?: string;
+      expectedAmountCents?: number | null;
+    } & RecurringPatternScheduleInput,
+  ) => request<RecurringPattern>(`/households/${householdId}/recurring-patterns/${patternId}/confirm`, { method: "POST", body: JSON.stringify(input) }),
   dismissRecurringPattern: (householdId: string, patternId: string) =>
     request<{ ok: true }>(`/households/${householdId}/recurring-patterns/${patternId}/dismiss`, { method: "POST" }),
   // Removes the series and every occurrence it projected — the calendar's

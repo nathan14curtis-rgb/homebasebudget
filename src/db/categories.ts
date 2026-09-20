@@ -2,7 +2,7 @@ import { newId } from "../lib/id";
 import { DEFAULT_CATEGORIES } from "../lib/defaultCategories";
 import type { Category, CategoryKind, Envelope, RolloverMode } from "../types";
 import { getScoped, listScoped, NotFoundError, nowIso } from "./client";
-import { archiveEnvelopeForCategory, unarchiveEnvelopeForCategory } from "./envelopes";
+import { archiveEnvelopeForCategory, getEnvelopeByCategory, unarchiveEnvelopeForCategory, updateEnvelope } from "./envelopes";
 
 export async function listCategories(db: D1Database, householdId: string): Promise<Category[]> {
   return listScoped<Category>(db, "category", householdId, "sort_order, name");
@@ -23,6 +23,43 @@ export async function getDefaultIncomeCategory(db: D1Database, householdId: stri
   const income = categories.filter((c) => c.kind === "income" && !c.archived_at);
   if (income.length === 0) return null;
   return income.find((c) => c.name.toLowerCase() === "other income") ?? income[0]!;
+}
+
+/** The active category already called `name`, if there is one. Names are
+ * compared case-insensitively and trimmed, because "utilities" typed into
+ * a form is the seeded "Utilities", not a second one — the schema's
+ * UNIQUE (household_id, parent_id, name) does not catch this since
+ * top-level categories have a NULL parent_id and SQLite treats NULLs as
+ * distinct. `kind` narrows the match when the caller knows what it is
+ * creating. */
+export async function findActiveCategoryByName(
+  db: D1Database,
+  householdId: string,
+  name: string,
+  kind?: CategoryKind,
+): Promise<Category | null> {
+  const clauses = ["household_id = ?", "archived_at IS NULL", "lower(trim(name)) = lower(?)"];
+  const params: unknown[] = [householdId, name.trim()];
+  if (kind) {
+    clauses.push("kind = ?");
+    params.push(kind);
+  }
+  return db
+    .prepare(`SELECT * FROM category WHERE ${clauses.join(" AND ")} ORDER BY created_at LIMIT 1`)
+    .bind(...params)
+    .first<Category>();
+}
+
+/** Reuse the active category called `name` when there is one, otherwise
+ * create it — what every "type a name" form means. */
+export async function findOrCreateCategory(
+  db: D1Database,
+  householdId: string,
+  input: { name: string; kind: CategoryKind },
+): Promise<{ category: Category; created: boolean }> {
+  const existing = await findActiveCategoryByName(db, householdId, input.name, input.kind);
+  if (existing) return { category: existing, created: false };
+  return { category: await createCategory(db, householdId, { name: input.name.trim(), kind: input.kind }), created: true };
 }
 
 export async function createCategory(
@@ -98,6 +135,33 @@ export async function createEnvelopeForCategory(
     created_at: now,
     updated_at: now,
   };
+}
+
+/**
+ * An expense category that has a recurring series is a bill, and its
+ * envelope should say so wherever the dashboard asks: grouped under
+ * "Bills" (which is what keeps it off the Spending Plan, out of the
+ * per-day burn on the calendar, and out of the header's "% of budget"),
+ * and targeting what the series expects, so the two pages agree on how
+ * much the electric bill is. Creates the envelope if the category somehow
+ * has none. Income and savings categories have nothing to sync.
+ */
+export async function syncBillEnvelope(
+  db: D1Database,
+  householdId: string,
+  category: Category,
+  expectedAmountCents?: number | null,
+): Promise<Envelope | null> {
+  if (category.kind !== "expense") return null;
+  const existing = await getEnvelopeByCategory(db, householdId, category.id);
+  if (!existing) {
+    return createEnvelopeForCategory(db, householdId, category, { groupName: "Bills", monthlyTargetCents: expectedAmountCents ?? null });
+  }
+  const patch: { groupName?: string; monthlyTargetCents?: number | null } = {};
+  if (existing.group_name.toLowerCase() !== "bills") patch.groupName = "Bills";
+  if (expectedAmountCents !== undefined && expectedAmountCents !== existing.monthly_target_cents) patch.monthlyTargetCents = expectedAmountCents;
+  if (Object.keys(patch).length === 0) return existing;
+  return updateEnvelope(db, householdId, existing.id, patch);
 }
 
 /** Rename only — kind is fixed at creation (changing it would orphan the

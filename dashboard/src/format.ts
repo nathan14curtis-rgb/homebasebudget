@@ -3,8 +3,12 @@ export function formatCents(cents: number): string {
   return `${sign}$${(Math.abs(cents) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-export function currentMonth(): string {
-  return new Date().toISOString().slice(0, 7);
+/** 'YYYY-MM' in local time, the same clock as the calendar's todayIso().
+ * (toISOString() is UTC, which from about 6 pm Mountain on the last day of
+ * a month is already next month — and an adjustment made then landed in
+ * the wrong month.) */
+export function currentMonth(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 }
 
 /** Days remaining in the current month, counting today — matches the

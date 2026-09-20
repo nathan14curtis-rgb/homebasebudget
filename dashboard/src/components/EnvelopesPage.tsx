@@ -17,6 +17,7 @@ import { TransactionDetailModal } from "./TransactionDetailModal";
 import { Modal } from "./ScheduleFields";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { IncludedExcludedList, PlanRow, planItemDate, type PlanItem } from "./PlanRow";
+import { BudgetCsvSection } from "./BudgetCsvSection";
 
 interface Props {
   householdId: string;
@@ -231,6 +232,22 @@ function EnvelopeRow({
   const txnCount = items.filter((i) => i.kind === "transaction" && !i.transaction.excluded_from_budget).length;
   const isGoal = category?.kind === "savings";
 
+  // A target is a plan; funding is what puts the money in the envelope.
+  // Without this the row read "over budget" from the first purchase,
+  // because nothing had ever been allocated against the target.
+  const fundedCents = (summary?.carriedInCents ?? 0) + (summary?.allocatedCents ?? 0);
+  const unfunded = target !== null && !isGoal && fundedCents < target;
+
+  async function fundToTarget() {
+    setActionError(null);
+    try {
+      await api.fundEnvelopes(householdId, { month: currentMonth(), envelopeIds: [envelope.id] });
+      await onChanged();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to fund this envelope");
+    }
+  }
+
   async function releaseUnspentFunds() {
     if (rolloverCents <= 0) return;
     setActionError(null);
@@ -366,17 +383,25 @@ function EnvelopeRow({
               ? "Saved so far"
               : target === null
                 ? "Spent this month"
-                : over
-                  ? "Over budget"
-                  : rolloverCents > 0
-                    ? "Available with rollover"
-                    : "Available to spend"}
+                : unfunded
+                  ? "Not funded to target yet"
+                  : over
+                    ? "Over budget"
+                    : rolloverCents > 0
+                      ? "Available with rollover"
+                      : "Available to spend"}
           </div>
+          {unfunded && (
+            <button type="button" className="link-button" onClick={() => void fundToTarget()}>
+              Fund {formatCents(target - fundedCents)} to target
+            </button>
+          )}
         </div>
 
         <EnvelopeMenu
           actions={[
             { label: "Edit amount", icon: "✎", onClick: onEdit },
+            { label: "Fund to target", icon: "＄", disabled: target === null || fundedCents >= target, onClick: () => void fundToTarget() },
             { label: "Release unspent funds", icon: "↩", disabled: rolloverCents <= 0, onClick: releaseUnspentFunds },
             { label: "Change rollover amount", icon: "⇄", onClick: onAdjustRollover },
             {
@@ -772,6 +797,7 @@ export function EnvelopesPage({
   const [confirmingRebuild, setConfirmingRebuild] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [rowError, setRowError] = useState<string | null>(null);
+  const [funding, setFunding] = useState(false);
 
   const month = currentMonth();
 
@@ -918,6 +944,39 @@ export function EnvelopesPage({
 
   async function refreshAfterRowAction() {
     await Promise.all([onChanged(), onTransactionsChanged()]);
+  }
+
+  /** Everything the page shows, plus the calendar: a CSV can add or end
+   * bills as well as envelopes. */
+  async function refreshAfterBulkEdit() {
+    await Promise.all([onChanged(), onTransactionsChanged(), recurring.refresh()]);
+  }
+
+  /** Every planned envelope short of its target this month, in cents. */
+  const shortfallCents = useMemo(
+    () =>
+      plannedEnvelopes
+        .filter((e) => categoryById.get(e.category_id)?.kind === "expense")
+        .reduce((sum, e) => {
+          const summary = envelopeSummaries[e.id];
+          const funded = (summary?.carriedInCents ?? 0) + (summary?.allocatedCents ?? 0);
+          return sum + Math.max(0, (e.monthly_target_cents ?? 0) - funded);
+        }, 0),
+    [plannedEnvelopes, categoryById, envelopeSummaries],
+  );
+
+  async function fundAllToTarget() {
+    setFunding(true);
+    setError(null);
+    try {
+      const expenseIds = plannedEnvelopes.filter((e) => categoryById.get(e.category_id)?.kind === "expense").map((e) => e.id);
+      await api.fundEnvelopes(householdId, { month, envelopeIds: expenseIds });
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fund the plan");
+    } finally {
+      setFunding(false);
+    }
   }
 
   async function toggleExcluded(transaction: Transaction) {
@@ -1078,6 +1137,11 @@ export function EnvelopesPage({
               .
             </p>
           </div>
+          {shortfallCents > 0 && (
+            <button type="button" className="secondary" onClick={() => void fundAllToTarget()} disabled={funding} title="Put this month's planned amounts into every envelope that is short">
+              {funding ? "Funding…" : `Fund all to target (${formatCents(shortfallCents)})`}
+            </button>
+          )}
         </div>
 
         {groupedPlanned.length > 0 ? (
@@ -1194,6 +1258,8 @@ export function EnvelopesPage({
         )}
         {suggestError && <p className="error">{suggestError}</p>}
       </section>
+
+      <BudgetCsvSection householdId={householdId} onChanged={refreshAfterBulkEdit} />
 
       {error && <p className="error">{error}</p>}
       {rowError && <p className="error">{rowError}</p>}

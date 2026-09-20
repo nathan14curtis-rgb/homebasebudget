@@ -1,6 +1,7 @@
 import { newId } from "../lib/id";
 import type { RecurringPattern, RecurringPatternFrequency, RecurringPatternKind, RecurringPatternStatus } from "../types";
 import { nowIso } from "./client";
+import { realignOccurrences } from "../envelopes/occurrences";
 
 const MIN_OCCURRENCES = 2;
 const MIN_DISTINCT_MONTHS = 2;
@@ -266,7 +267,7 @@ export async function updateRecurringPattern(
     .bind(merchantPattern, categoryId, frequency, dayOfMonth, dayOfMonth2, dayOfWeek, dayTolerance, expectedAmountCents, endedAt, now, id, householdId)
     .run();
 
-  return {
+  const updated: RecurringPattern = {
     ...existing,
     merchant_pattern: merchantPattern,
     category_id: categoryId,
@@ -279,6 +280,10 @@ export async function updateRecurringPattern(
     ended_at: endedAt,
     updated_at: now,
   };
+  // The squares already on the calendar have to follow the series they
+  // came from, or an edit here never shows up there.
+  await realignOccurrences(db, householdId, updated);
+  return updated;
 }
 
 export async function dismissRecurringPattern(db: D1Database, householdId: string, id: string): Promise<void> {

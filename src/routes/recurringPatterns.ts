@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { requireParam } from "../lib/http";
 import type { Env } from "../types";
-import { createCategory, createEnvelopeForCategory } from "../db/categories";
+import { findOrCreateCategory, getCategory, syncBillEnvelope } from "../db/categories";
 import type { RecurringPatternFrequency } from "../types";
 import {
   confirmRecurringPattern,
@@ -77,30 +77,35 @@ recurringPatternsRoute.post("/", async (c) => {
     return c.json({ error: "expectedAmountCents must be an integer number of cents" }, 400);
   }
 
-  let categoryId = body.categoryId;
-  if (!categoryId) {
-    if (!body.newCategoryName?.trim()) return c.json({ error: "categoryId or newCategoryName is required" }, 400);
-    const category = await createCategory(c.env.DB, householdId, { name: body.newCategoryName.trim(), kind: body.kind });
-    if (category.kind === "expense") {
-      await createEnvelopeForCategory(c.env.DB, householdId, category, { groupName: "Bills", monthlyTargetCents: body.monthlyTargetCents ?? null });
-    }
-    categoryId = category.id;
-  }
+  const expectedAmountCents = body.expectedAmountCents ?? body.monthlyTargetCents ?? null;
+  // A typed name that matches a category the household already has is
+  // that category, not a second one with the same name — otherwise the
+  // charges already filed under the original never tick this bill off.
+  const category = body.categoryId
+    ? await getCategory(c.env.DB, householdId, body.categoryId)
+    : body.newCategoryName?.trim()
+      ? (await findOrCreateCategory(c.env.DB, householdId, { name: body.newCategoryName, kind: body.kind })).category
+      : null;
+  if (!category) return c.json({ error: "categoryId or newCategoryName is required" }, 400);
 
   const pattern = await createConfirmedRecurringPattern(c.env.DB, householdId, {
-    categoryId,
+    categoryId: category.id,
     merchantPattern: body.merchantPattern,
     kind: body.kind,
     // What the Bills & Income calendar projects a tile at before anything
     // has posted. An expense also mirrors it onto its envelope's monthly
-    // target above; income has no envelope, so this is its only home.
-    expectedAmountCents: body.expectedAmountCents ?? body.monthlyTargetCents,
+    // target below; income has no envelope, so this is its only home.
+    expectedAmountCents,
     frequency: schedule.frequency,
     dayOfMonth: body.dayOfMonth ?? 1,
     dayOfMonth2: body.dayOfMonth2,
     dayOfWeek: body.dayOfWeek,
     dayTolerance: body.dayTolerance,
   });
+  // Whether the category was new or picked from the list, its envelope is
+  // now a bill's: grouped under Bills and targeting what the series
+  // expects, so the plan, the calendar, and the header all agree.
+  await syncBillEnvelope(c.env.DB, householdId, category, expectedAmountCents);
   return c.json(pattern, 201);
 });
 
@@ -116,22 +121,55 @@ recurringPatternsRoute.post("/detect", async (c) => {
 // either an existing one (categoryId) or a brand-new one created on the
 // spot (newCategoryName), the same category+envelope pairing
 // routes/categories.ts's POST / does for a manually-added bill.
+// The calendar's "Add to calendar" sends the amount, schedule and merchant
+// the person corrected in the same dialog, so those are accepted here too
+// rather than needing a second request that could be forgotten.
 recurringPatternsRoute.post("/:patternId/confirm", async (c) => {
   const householdId = requireParam(c, "householdId");
-  const body = await c.req.json<{ categoryId?: string; newCategoryName?: string; kind?: "expense" | "income" }>();
+  const patternId = requireParam(c, "patternId");
+  const body = await c.req.json<{
+    categoryId?: string;
+    newCategoryName?: string;
+    kind?: "expense" | "income";
+    merchantPattern?: string;
+    expectedAmountCents?: number | null;
+    frequency?: string;
+    dayOfMonth?: number;
+    dayOfMonth2?: number;
+    dayOfWeek?: number;
+    dayTolerance?: number;
+  }>();
 
-  let categoryId = body.categoryId;
-  if (!categoryId) {
-    if (!body.newCategoryName?.trim()) return c.json({ error: "categoryId or newCategoryName is required" }, 400);
-    if (body.kind !== "expense" && body.kind !== "income") return c.json({ error: "kind ('expense' or 'income') is required with newCategoryName" }, 400);
-    const category = await createCategory(c.env.DB, householdId, { name: body.newCategoryName.trim(), kind: body.kind });
-    if (category.kind === "expense") {
-      await createEnvelopeForCategory(c.env.DB, householdId, category, { groupName: "Bills" });
-    }
-    categoryId = category.id;
+  const existing = await getRecurringPattern(c.env.DB, householdId, patternId);
+  if (!existing) return c.json({ error: "recurring pattern not found" }, 404);
+  const kind = body.kind ?? existing.kind;
+  if (body.merchantPattern !== undefined && !body.merchantPattern.trim()) return c.json({ error: "merchantPattern cannot be blank" }, 400);
+  if (body.expectedAmountCents !== undefined && body.expectedAmountCents !== null && !Number.isInteger(body.expectedAmountCents)) {
+    return c.json({ error: "expectedAmountCents must be an integer number of cents, or null to clear it" }, 400);
+  }
+  if (body.frequency !== undefined) {
+    const schedule = validateSchedule(body);
+    if ("error" in schedule) return c.json({ error: schedule.error }, 400);
   }
 
-  const pattern = await confirmRecurringPattern(c.env.DB, householdId, requireParam(c, "patternId"), categoryId);
+  const category = body.categoryId
+    ? await getCategory(c.env.DB, householdId, body.categoryId)
+    : body.newCategoryName?.trim()
+      ? (await findOrCreateCategory(c.env.DB, householdId, { name: body.newCategoryName, kind })).category
+      : null;
+  if (!category) return c.json({ error: "categoryId or newCategoryName is required" }, 400);
+
+  await confirmRecurringPattern(c.env.DB, householdId, patternId, category.id);
+  const pattern = await updateRecurringPattern(c.env.DB, householdId, patternId, {
+    merchantPattern: body.merchantPattern,
+    ...("expectedAmountCents" in body ? { expectedAmountCents: body.expectedAmountCents } : {}),
+    frequency: body.frequency as RecurringPatternFrequency | undefined,
+    dayOfMonth: body.dayOfMonth,
+    dayOfMonth2: body.dayOfMonth2,
+    dayOfWeek: body.dayOfWeek,
+    dayTolerance: body.dayTolerance,
+  });
+  await syncBillEnvelope(c.env.DB, householdId, category, pattern.expected_amount_cents);
   return c.json(pattern);
 });
 
@@ -165,7 +203,8 @@ recurringPatternsRoute.patch("/:patternId", async (c) => {
     if ("error" in schedule) return c.json({ error: schedule.error }, 400);
   }
 
-  const pattern = await updateRecurringPattern(c.env.DB, requireParam(c, "householdId"), requireParam(c, "patternId"), {
+  const householdId = requireParam(c, "householdId");
+  const pattern = await updateRecurringPattern(c.env.DB, householdId, requireParam(c, "patternId"), {
     merchantPattern: body.merchantPattern,
     categoryId: body.categoryId,
     ...("expectedAmountCents" in body ? { expectedAmountCents: body.expectedAmountCents } : {}),
@@ -176,6 +215,12 @@ recurringPatternsRoute.patch("/:patternId", async (c) => {
     dayOfWeek: body.dayOfWeek,
     dayTolerance: body.dayTolerance,
   });
+  // A bill's envelope target is what the Spending Plan reserves for it,
+  // so a new expected amount (or a re-pointed category) is mirrored there.
+  if (pattern.status === "confirmed" && pattern.category_id && ("expectedAmountCents" in body || body.categoryId)) {
+    const category = await getCategory(c.env.DB, householdId, pattern.category_id);
+    await syncBillEnvelope(c.env.DB, householdId, category, pattern.expected_amount_cents);
+  }
   return c.json(pattern);
 });
 
