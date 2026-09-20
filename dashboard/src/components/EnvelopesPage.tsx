@@ -11,13 +11,20 @@ import {
   type Transaction,
 } from "../api";
 import { formatCents, currentMonth } from "../format";
+import { parseMoney, moneyToInput } from "../money";
+import { VALIDATION } from "../copy";
 import type { Recurring } from "../useRecurring";
 import { usePageAction } from "../pageAction";
 import { TransactionDetailModal } from "./TransactionDetailModal";
 import { Modal } from "./ScheduleFields";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { IncludedExcludedList, PlanRow, planItemDate, type PlanItem } from "./PlanRow";
+import { MoneyInput } from "./MoneyInput";
+import { Notice, useAction } from "./Notice";
+import { EmptyState } from "./EmptyState";
 import { BudgetCsvSection } from "./BudgetCsvSection";
+import { IncludedExcludedList, PlanRow, planItemDate, type PlanItem } from "./PlanRow";
+
+const DEFAULT_GROUP = "Everyday";
 
 interface Props {
   householdId: string;
@@ -48,33 +55,32 @@ function EnvelopeDrilldown({
   renderRow: (item: PlanItem) => React.ReactNode;
   onBalanceAdjusted: () => Promise<void>;
 }) {
-  const [error, setError] = useState<string | null>(null);
   const [adjustAmount, setAdjustAmount] = useState("");
   const [adjustNote, setAdjustNote] = useState("");
-  const [adjusting, setAdjusting] = useState(false);
+  const action = useAction();
+  const adjusting = action.busy;
 
   async function adjustBalance(e: FormEvent) {
     e.preventDefault();
-    const cents = Math.round(Number(adjustAmount) * 100);
-    if (!Number.isFinite(cents) || cents === 0) {
-      setError("Enter an amount to move — a positive number adds, a negative one takes away.");
+    const cents = parseMoney(adjustAmount, { allowNegative: true });
+    if (cents === null || cents === 0) {
+      action.showError("Enter an amount to move. A positive number adds to this envelope, a negative one takes away.");
       return;
     }
-    setAdjusting(true);
-    setError(null);
-    try {
-      await api.allocateToEnvelope(householdId, envelope.id, {
-        month: currentMonth(),
-        amountCents: cents,
-        note: adjustNote.trim() || "Manual balance adjustment",
-      });
+    const ok = await action.run(
+      async () => {
+        await api.allocateToEnvelope(householdId, envelope.id, {
+          month: currentMonth(),
+          amountCents: cents,
+          note: adjustNote.trim() || "Manual balance adjustment",
+        });
+        await onBalanceAdjusted();
+      },
+      { success: `${cents > 0 ? "Added" : "Took"} ${formatCents(Math.abs(cents))} ${cents > 0 ? "to" : "from"} ${category?.name ?? "this envelope"}.` },
+    );
+    if (ok) {
       setAdjustAmount("");
       setAdjustNote("");
-      await onBalanceAdjusted();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to adjust balance");
-    } finally {
-      setAdjusting(false);
     }
   }
 
@@ -90,32 +96,21 @@ function EnvelopeDrilldown({
 
       <IncludedExcludedList items={items} emptyLabel="Nothing spent from this envelope yet this month." renderRow={renderRow} />
 
-      <form className="row" onSubmit={adjustBalance}>
-        <div className="input-prefix" style={{ width: 200 }}>
-          <span aria-hidden>$</span>
-          <input
-            type="text"
-            inputMode="decimal"
-            aria-label="Adjust this envelope's balance by"
-            placeholder="Move money, e.g. -25"
-            value={adjustAmount}
-            onChange={(e) => setAdjustAmount(e.target.value)}
-          />
+      <form className="row" onSubmit={adjustBalance} style={{ alignItems: "flex-end" }}>
+        <div className="field-inline">
+          <label htmlFor={`adjust-${envelope.id}`}>Move money in or out</label>
+          <MoneyInput id={`adjust-${envelope.id}`} value={adjustAmount} onChange={setAdjustAmount} disabled={adjusting} placeholder="e.g. 25, or -25" width={200} />
         </div>
-        <input
-          type="text"
-          aria-label="Note for this adjustment"
-          placeholder="Note (optional)"
-          value={adjustNote}
-          onChange={(e) => setAdjustNote(e.target.value)}
-          style={{ flex: 1, minWidth: 160 }}
-        />
+        <div className="field-inline" style={{ flex: 1, minWidth: 160 }}>
+          <label htmlFor={`adjust-note-${envelope.id}`}>Note (optional)</label>
+          <input id={`adjust-note-${envelope.id}`} type="text" value={adjustNote} disabled={adjusting} onChange={(e) => setAdjustNote(e.target.value)} />
+        </div>
         <button type="submit" disabled={adjusting}>
-          {adjusting ? "Applying…" : "Apply"}
+          {adjusting ? "Saving…" : "Save"}
         </button>
       </form>
 
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} />
     </div>
   );
 }
@@ -207,6 +202,7 @@ function EnvelopeRow({
   onChanged,
   onArchive,
   onAdjustRollover,
+  onRelease,
 }: {
   householdId: string;
   envelope: Envelope;
@@ -220,8 +216,9 @@ function EnvelopeRow({
   onChanged: () => Promise<void>;
   onArchive: () => void;
   onAdjustRollover: () => void;
+  onRelease: (rolloverCents: number) => void;
 }) {
-  const [actionError, setActionError] = useState<string | null>(null);
+  const action = useAction();
 
   const target = envelope.monthly_target_cents;
   const balance = summary?.balanceCents ?? 0;
@@ -232,50 +229,37 @@ function EnvelopeRow({
   const txnCount = items.filter((i) => i.kind === "transaction" && !i.transaction.excluded_from_budget).length;
   const isGoal = category?.kind === "savings";
 
-  // A target is a plan; funding is what puts the money in the envelope.
-  // Without this the row read "over budget" from the first purchase,
-  // because nothing had ever been allocated against the target.
+  // A target is a plan, not money: until this month's allocation ledger
+  // holds the planned amount, "available to spend" starts at zero and the
+  // first purchase reads as over budget. This is what's actually in it.
   const fundedCents = (summary?.carriedInCents ?? 0) + (summary?.allocatedCents ?? 0);
   const unfunded = target !== null && !isGoal && fundedCents < target;
 
-  async function fundToTarget() {
-    setActionError(null);
-    try {
-      await api.fundEnvelopes(householdId, { month: currentMonth(), envelopeIds: [envelope.id] });
-      await onChanged();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Failed to fund this envelope");
-    }
-  }
-
-  async function releaseUnspentFunds() {
-    if (rolloverCents <= 0) return;
-    setActionError(null);
-    try {
-      await api.allocateToEnvelope(householdId, envelope.id, {
-        month: currentMonth(),
-        amountCents: -rolloverCents,
-        note: "Released unspent funds",
-      });
-      await onChanged();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Failed to release unspent funds");
-    }
+  function fundToTarget() {
+    if (target === null) return;
+    const shortfall = target - fundedCents;
+    void action.run(
+      async () => {
+        await api.fundEnvelopes(householdId, { month: currentMonth(), envelopeIds: [envelope.id] });
+        await onChanged();
+      },
+      { success: `${formatCents(shortfall)} put into ${category?.name ?? "this envelope"} for this month.` },
+    );
   }
 
   /** Whether this envelope's leftovers survive the turn of the month. The
    * per-month adjustments ("release", "change rollover amount") fix one
    * month; this is the standing answer, and the backend settles it with a
    * correction entry the next time the month is read. */
-  async function toggleRolloverMode() {
+  function toggleRolloverMode() {
     const next = envelope.rollover_mode === "reset" ? "carry" : "reset";
-    setActionError(null);
-    try {
-      await api.updateEnvelope(householdId, envelope.id, { rolloverMode: next });
-      await onChanged();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Failed to change rollover setting");
-    }
+    void action.run(
+      async () => {
+        await api.updateEnvelope(householdId, envelope.id, { rolloverMode: next });
+        await onChanged();
+      },
+      { success: next === "reset" ? `${category?.name ?? "This envelope"} now starts fresh each month.` : `${category?.name ?? "This envelope"} now carries leftovers over.` },
+    );
   }
 
   const barTotal = Math.max(target ?? 0, balance, 1);
@@ -391,8 +375,8 @@ function EnvelopeRow({
                       ? "Available with rollover"
                       : "Available to spend"}
           </div>
-          {unfunded && (
-            <button type="button" className="link-button" onClick={() => void fundToTarget()}>
+          {unfunded && target !== null && (
+            <button type="button" className="link-button" disabled={action.busy} onClick={fundToTarget} style={{ fontSize: 12 }}>
               Fund {formatCents(target - fundedCents)} to target
             </button>
           )}
@@ -400,22 +384,23 @@ function EnvelopeRow({
 
         <EnvelopeMenu
           actions={[
-            { label: "Edit amount", icon: "✎", onClick: onEdit },
-            { label: "Fund to target", icon: "＄", disabled: target === null || fundedCents >= target, onClick: () => void fundToTarget() },
-            { label: "Release unspent funds", icon: "↩", disabled: rolloverCents <= 0, onClick: releaseUnspentFunds },
+            { label: "Edit", icon: "✎", onClick: onEdit },
+            { label: "Fund to target", icon: "＄", disabled: target === null || isGoal || fundedCents >= target || action.busy, onClick: fundToTarget },
+            { label: "Release unspent funds", icon: "↩", disabled: rolloverCents <= 0 || action.busy, onClick: () => onRelease(rolloverCents) },
             { label: "Change rollover amount", icon: "⇄", onClick: onAdjustRollover },
             {
               label: envelope.rollover_mode === "reset" ? "Roll leftovers over each month" : "Start fresh each month",
               icon: "⟲",
+              disabled: action.busy,
               onClick: toggleRolloverMode,
             },
             { label: "Archive", icon: "🗄", danger: true, onClick: onArchive },
           ]}
         />
       </div>
-      {actionError && (
-        <div className="row-item">
-          <p className="error" style={{ margin: 0 }}>{actionError}</p>
+      {action.notice && (
+        <div className="row-item" style={{ display: "block" }}>
+          <Notice notice={action.notice} onDismiss={action.clear} />
         </div>
       )}
       {isExpanded && (
@@ -440,7 +425,7 @@ function EnvelopeRow({
  * lives, so there is one answer to "how much is the electric bill" rather
  * than two that can disagree.
  */
-function EditEnvelopeModal({
+export function EditEnvelopeModal({
   householdId,
   envelope,
   category,
@@ -454,46 +439,36 @@ function EditEnvelopeModal({
   onSaved: () => Promise<void>;
 }) {
   const [name, setName] = useState(category?.name ?? "");
-  const [amount, setAmount] = useState(envelope.monthly_target_cents !== null ? (envelope.monthly_target_cents / 100).toFixed(2) : "");
+  const [amount, setAmount] = useState(moneyToInput(envelope.monthly_target_cents));
   const [groupName, setGroupName] = useState(envelope.group_name);
   const [targetDate, setTargetDate] = useState(envelope.target_date ?? "");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const action = useAction();
+  const saving = action.busy;
 
   const isGoal = category?.kind === "savings";
 
   async function save() {
     const trimmedName = name.trim();
-    if (!trimmedName) {
-      setError("Give this envelope a name");
-      return;
-    }
-    if (amount.trim() && !Number.isFinite(Number(amount))) {
-      setError("Enter a valid amount, or clear it to leave this envelope untargeted");
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
+    if (!trimmedName) return action.showError(VALIDATION.name);
+    const cents = amount.trim() ? parseMoney(amount) : null;
+    if (amount.trim() && cents === null) return action.showError("Enter a valid amount, or clear it to plan no amount for this envelope.");
+    const ok = await action.run(async () => {
       await api.updateEnvelope(householdId, envelope.id, {
-        groupName: groupName.trim() || "Uncategorized",
-        monthlyTargetCents: amount.trim() ? Math.round(Number(amount) * 100) : null,
+        groupName: groupName.trim() || DEFAULT_GROUP,
+        monthlyTargetCents: cents,
         targetDate: isGoal ? targetDate || null : envelope.target_date,
       });
       if (category && trimmedName !== category.name) {
         await api.renameCategory(householdId, category.id, trimmedName);
       }
       await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save");
-      setSaving(false);
-    }
+    });
+    if (ok) onClose();
   }
 
   return (
     <Modal
-      title={category?.name ?? "Edit envelope"}
+      title={`Edit ${category?.name ?? "envelope"}`}
       onClose={onClose}
       footer={
         <>
@@ -513,17 +488,7 @@ function EditEnvelopeModal({
 
       <div className="field">
         <label htmlFor="edit-amount">{isGoal ? "Total needed" : "Amount each month"}</label>
-        <div className="input-prefix">
-          <span aria-hidden>$</span>
-          <input
-            id="edit-amount"
-            type="text"
-            inputMode="decimal"
-            placeholder="No target set"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-          />
-        </div>
+        <MoneyInput id="edit-amount" value={amount} onChange={setAmount} disabled={saving} placeholder="None planned" />
         <p className="hint">
           {isGoal
             ? "What this goal needs in total. The plan works out this month's share from the date below."
@@ -545,12 +510,12 @@ function EditEnvelopeModal({
 
       {isGoal && (
         <div className="field">
-          <label htmlFor="edit-goal-date">Goal date</label>
+          <label htmlFor="edit-goal-date">Reach it by</label>
           <input id="edit-goal-date" type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
         </div>
       )}
 
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} />
     </Modal>
   );
 }
@@ -571,29 +536,24 @@ function NewEnvelopeModal({
   const [amount, setAmount] = useState("");
   const [groupName, setGroupName] = useState("");
   const [targetDate, setTargetDate] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const action = useAction();
+  const saving = action.busy;
 
   async function save() {
-    if (!name.trim()) return setError("Give this envelope a name");
-    const cents = amount.trim() ? Math.round(Number(amount) * 100) : undefined;
-    if (cents !== undefined && !Number.isFinite(cents)) return setError("Enter a valid amount");
-    setSaving(true);
-    setError(null);
-    try {
+    if (!name.trim()) return action.showError(VALIDATION.name);
+    const cents = amount.trim() ? parseMoney(amount) : null;
+    if (amount.trim() && cents === null) return action.showError(VALIDATION.amount);
+    const ok = await action.run(async () => {
       await api.createCategory(householdId, {
         name: name.trim(),
         kind,
-        groupName: groupName.trim() || undefined,
-        monthlyTargetCents: cents,
+        groupName: groupName.trim() || (kind === "savings" ? "Goals" : DEFAULT_GROUP),
+        monthlyTargetCents: cents ?? undefined,
         targetDate: kind === "savings" && targetDate ? targetDate : undefined,
       });
       await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create the envelope");
-      setSaving(false);
-    }
+    });
+    if (ok) onClose();
   }
 
   return (
@@ -606,7 +566,7 @@ function NewEnvelopeModal({
             Cancel
           </button>
           <button type="button" onClick={save} disabled={saving}>
-            {saving ? "Creating…" : "Create envelope"}
+            {saving ? "Adding…" : "Add envelope"}
           </button>
         </>
       }
@@ -650,22 +610,12 @@ function NewEnvelopeModal({
 
       <div className="field">
         <label htmlFor="new-env-amount">{kind === "savings" ? "Total needed" : "Amount each month"}</label>
-        <div className="input-prefix">
-          <span aria-hidden>$</span>
-          <input
-            id="new-env-amount"
-            type="text"
-            inputMode="decimal"
-            placeholder="0.00"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-          />
-        </div>
+        <MoneyInput id="new-env-amount" value={amount} onChange={setAmount} disabled={saving} />
       </div>
 
       {kind === "savings" && (
         <div className="field">
-          <label htmlFor="new-env-date">Goal date</label>
+          <label htmlFor="new-env-date">Reach it by</label>
           <input id="new-env-date" type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
         </div>
       )}
@@ -675,7 +625,7 @@ function NewEnvelopeModal({
         <input id="new-env-group" type="text" placeholder="e.g. Everyday" value={groupName} onChange={(e) => setGroupName(e.target.value)} />
       </div>
 
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} />
     </Modal>
   );
 }
@@ -698,25 +648,20 @@ function RolloverModal({
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
-  const [amount, setAmount] = useState((Math.max(0, currentRolloverCents) / 100).toFixed(2));
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [amount, setAmount] = useState(moneyToInput(Math.max(0, currentRolloverCents)));
+  const action = useAction();
+  const saving = action.busy;
 
   async function save() {
-    const desired = Math.round(Number(amount) * 100);
-    if (!Number.isFinite(desired)) return setError("Enter a valid amount");
+    const desired = parseMoney(amount);
+    if (desired === null) return action.showError(VALIDATION.amount);
     const delta = desired - Math.max(0, currentRolloverCents);
     if (delta === 0) return onClose();
-    setSaving(true);
-    setError(null);
-    try {
+    const ok = await action.run(async () => {
       await api.allocateToEnvelope(householdId, envelope.id, { month: currentMonth(), amountCents: delta, note: "Change rollover amount" });
       await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to change the rollover");
-      setSaving(false);
-    }
+    });
+    if (ok) onClose();
   }
 
   return (
@@ -729,7 +674,7 @@ function RolloverModal({
             Cancel
           </button>
           <button type="button" onClick={save} disabled={saving}>
-            {saving ? "Saving…" : "Set rollover"}
+            {saving ? "Saving…" : "Save"}
           </button>
         </>
       }
@@ -739,19 +684,9 @@ function RolloverModal({
       </p>
       <div className="field">
         <label htmlFor="rollover-amount">Rollover</label>
-        <div className="input-prefix">
-          <span aria-hidden>$</span>
-          <input
-            id="rollover-amount"
-            type="text"
-            inputMode="decimal"
-            data-autofocus="true"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-          />
-        </div>
+        <MoneyInput id="rollover-amount" value={amount} onChange={setAmount} disabled={saving} autoFocus />
       </div>
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} />
     </Modal>
   );
 }
@@ -783,21 +718,20 @@ export function EnvelopesPage({
   onTransactionsChanged,
   onGoToBillsIncome,
 }: Props) {
-  const [error, setError] = useState<string | null>(null);
+  const page = useAction();
+  const suggest = useAction();
   const [editingEnvelope, setEditingEnvelope] = useState<Envelope | null>(null);
   const [adjustingRollover, setAdjustingRollover] = useState<{ envelope: Envelope; rolloverCents: number } | null>(null);
   const [creatingEnvelope, setCreatingEnvelope] = useState(false);
   const [archiving, setArchiving] = useState<{ categoryId: string; name: string } | null>(null);
+  const [releasing, setReleasing] = useState<{ envelope: Envelope; name: string; rolloverCents: number } | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [suggestions, setSuggestions] = useState<CategorySuggestion[] | null>(null);
   const [suggestChecked, setSuggestChecked] = useState<Record<number, boolean>>({});
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
-  const [suggestError, setSuggestError] = useState<string | null>(null);
-  const [rebuilding, setRebuilding] = useState(false);
   const [confirmingRebuild, setConfirmingRebuild] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
-  const [rowError, setRowError] = useState<string | null>(null);
-  const [funding, setFunding] = useState(false);
+  const loadingSuggestions = suggest.busyKey === "load";
+  const rebuilding = suggest.busyKey === "rebuild";
 
   const month = currentMonth();
 
@@ -946,47 +880,47 @@ export function EnvelopesPage({
     await Promise.all([onChanged(), onTransactionsChanged()]);
   }
 
-  /** Everything the page shows, plus the calendar: a CSV can add or end
-   * bills as well as envelopes. */
+  /** A CSV upload can touch envelopes, goals, bills and income at once. */
   async function refreshAfterBulkEdit() {
     await Promise.all([onChanged(), onTransactionsChanged(), recurring.refresh()]);
   }
 
-  /** Every planned envelope short of its target this month, in cents. */
+  /** How much this month's planned spending is still short of being funded. */
   const shortfallCents = useMemo(
     () =>
       plannedEnvelopes
         .filter((e) => categoryById.get(e.category_id)?.kind === "expense")
         .reduce((sum, e) => {
+          const target = e.monthly_target_cents ?? 0;
           const summary = envelopeSummaries[e.id];
           const funded = (summary?.carriedInCents ?? 0) + (summary?.allocatedCents ?? 0);
-          return sum + Math.max(0, (e.monthly_target_cents ?? 0) - funded);
+          return sum + Math.max(0, target - funded);
         }, 0),
     [plannedEnvelopes, categoryById, envelopeSummaries],
   );
 
-  async function fundAllToTarget() {
-    setFunding(true);
-    setError(null);
-    try {
-      const expenseIds = plannedEnvelopes.filter((e) => categoryById.get(e.category_id)?.kind === "expense").map((e) => e.id);
-      await api.fundEnvelopes(householdId, { month, envelopeIds: expenseIds });
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fund the plan");
-    } finally {
-      setFunding(false);
-    }
+  function fundAllToTarget() {
+    const expenseIds = plannedEnvelopes.filter((e) => categoryById.get(e.category_id)?.kind === "expense").map((e) => e.id);
+    if (expenseIds.length === 0) return;
+    void page.run(
+      async () => {
+        const result = await api.fundEnvelopes(householdId, { month, envelopeIds: expenseIds });
+        await onChanged();
+        return result;
+      },
+      { key: "fund-all", success: `${formatCents(shortfallCents)} put into this month's envelopes.` },
+    );
   }
 
-  async function toggleExcluded(transaction: Transaction) {
-    setRowError(null);
-    try {
-      await api.setTransactionExcluded(householdId, transaction.id, !transaction.excluded_from_budget);
-      await refreshAfterRowAction();
-    } catch (err) {
-      setRowError(err instanceof Error ? err.message : "Failed to update the row");
-    }
+  function toggleExcluded(transaction: Transaction) {
+    const name = transaction.normalized_merchant ?? transaction.raw_description;
+    void page.run(
+      async () => {
+        await api.setTransactionExcluded(householdId, transaction.id, !transaction.excluded_from_budget);
+        await refreshAfterRowAction();
+      },
+      { key: transaction.id, success: transaction.excluded_from_budget ? `${name} is back in the plan.` : `${name} left out of the plan.` },
+    );
   }
 
   function renderPlanRow(item: PlanItem) {
@@ -1002,7 +936,7 @@ export function EnvelopesPage({
         actions={[
           { label: "Edit transaction", icon: "✎", onClick: () => setEditingTransaction(transaction) },
           {
-            label: excluded ? "Include in Spending Plan" : "Exclude from Spending Plan",
+            label: excluded ? "Put back in the plan" : "Leave out of the plan",
             icon: excluded ? "＋" : "⊘",
             onClick: () => void toggleExcluded(transaction),
           },
@@ -1016,28 +950,15 @@ export function EnvelopesPage({
     return buildPlanItems(nonRecurringTransactions.filter((t) => t.category_id === envelope.category_id));
   }
 
-  async function archive(categoryId: string) {
-    setError(null);
-    try {
-      await api.archiveCategory(householdId, categoryId);
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to archive");
-    }
-  }
-
-  async function loadSuggestions() {
-    setSuggestError(null);
-    setLoadingSuggestions(true);
-    try {
-      const results = await api.suggestCategories(householdId);
-      setSuggestions(results);
-      setSuggestChecked(Object.fromEntries(results.map((_, i) => [i, true])));
-    } catch (err) {
-      setSuggestError(err instanceof Error ? err.message : "Failed to get suggestions");
-    } finally {
-      setLoadingSuggestions(false);
-    }
+  function loadSuggestions() {
+    void suggest.run(
+      async () => {
+        const results = await api.suggestCategories(householdId);
+        setSuggestions(results);
+        setSuggestChecked(Object.fromEntries(results.map((_, i) => [i, true])));
+      },
+      { key: "load" },
+    );
   }
 
   const rebuildArchiveTargets = useMemo(() => {
@@ -1051,28 +972,26 @@ export function EnvelopesPage({
   // old and new. Bills are untouched: they're the calendar's.
   async function rebuildFromSuggestions() {
     if (!suggestions) return;
+    const chosen = suggestions.filter((_, i) => suggestChecked[i]);
     setConfirmingRebuild(false);
-    setSuggestError(null);
-    setRebuilding(true);
-    try {
-      for (const c of rebuildArchiveTargets) {
-        await api.archiveCategory(householdId, c.id);
-      }
-      for (const s of suggestions.filter((_, i) => suggestChecked[i])) {
-        await api.createCategory(householdId, {
-          name: s.name,
-          kind: s.kind,
-          groupName: s.groupName || undefined,
-          monthlyTargetCents: s.monthlyTargetCents ?? undefined,
-        });
-      }
-      setSuggestions(null);
-      await onChanged();
-    } catch (err) {
-      setSuggestError(err instanceof Error ? err.message : "Failed to rebuild the spending plan");
-    } finally {
-      setRebuilding(false);
-    }
+    await suggest.run(
+      async () => {
+        for (const c of rebuildArchiveTargets) {
+          await api.archiveCategory(householdId, c.id);
+        }
+        for (const s of chosen) {
+          await api.createCategory(householdId, {
+            name: s.name,
+            kind: s.kind,
+            groupName: s.groupName || undefined,
+            monthlyTargetCents: s.monthlyTargetCents ?? undefined,
+          });
+        }
+        setSuggestions(null);
+        await onChanged();
+      },
+      { key: "rebuild", success: `Spending plan rebuilt with ${chosen.length} envelope${chosen.length === 1 ? "" : "s"}.` },
+    );
   }
 
   function renderEnvelope(envelope: Envelope) {
@@ -1094,12 +1013,15 @@ export function EnvelopesPage({
         onChanged={onChanged}
         onArchive={() => setArchiving({ categoryId: envelope.category_id, name: categoryById.get(envelope.category_id)?.name ?? "this envelope" })}
         onAdjustRollover={() => setAdjustingRollover({ envelope, rolloverCents })}
+        onRelease={(cents) => setReleasing({ envelope, name: categoryById.get(envelope.category_id)?.name ?? "this envelope", rolloverCents: cents })}
       />
     );
   }
 
   return (
     <div className="section">
+      <Notice notice={page.notice} onDismiss={page.clear} />
+
       <div className="grid-3">
         <div className="card card--emphasis card--padded stat-tile">
           <span className="label">Planned for spending</span>
@@ -1138,8 +1060,8 @@ export function EnvelopesPage({
             </p>
           </div>
           {shortfallCents > 0 && (
-            <button type="button" className="secondary" onClick={() => void fundAllToTarget()} disabled={funding} title="Put this month's planned amounts into every envelope that is short">
-              {funding ? "Funding…" : `Fund all to target (${formatCents(shortfallCents)})`}
+            <button type="button" className="secondary" onClick={fundAllToTarget} disabled={page.busyKey === "fund-all"}>
+              {page.busyKey === "fund-all" ? "Funding…" : `Fund all to target (${formatCents(shortfallCents)})`}
             </button>
           )}
         </div>
@@ -1152,13 +1074,11 @@ export function EnvelopesPage({
             </div>
           ))
         ) : (
-          <div className="empty-state">
-            <p className="empty-state-title">No envelopes planned yet</p>
-            <p className="hint">Set an amount aside for the things you spend on every month — groceries, gas, eating out.</p>
+          <EmptyState title="No envelopes planned yet" hint="Set an amount aside for the things you spend on every month: groceries, gas, eating out.">
             <button type="button" onClick={() => setCreatingEnvelope(true)}>
-              Create your first envelope
+              New envelope
             </button>
-          </div>
+          </EmptyState>
         )}
       </section>
 
@@ -1256,13 +1176,10 @@ export function EnvelopesPage({
             )}
           </div>
         )}
-        {suggestError && <p className="error">{suggestError}</p>}
+        <Notice notice={suggest.notice} onDismiss={suggest.clear} style={{ marginTop: 12 }} />
       </section>
 
       <BudgetCsvSection householdId={householdId} onChanged={refreshAfterBulkEdit} />
-
-      {error && <p className="error">{error}</p>}
-      {rowError && <p className="error">{rowError}</p>}
 
       {editingEnvelope && (
         <EditEnvelopeModal
@@ -1290,13 +1207,30 @@ export function EnvelopesPage({
       {archiving && (
         <ConfirmDialog
           title={`Archive ${archiving.name}?`}
-          body="It stops showing on the plan. Transactions already filed under it keep their category, and you can bring it back from Settings."
-          confirmLabel="Archive it"
+          body="It stops showing on the plan. Transactions already filed under it keep their category, and you can restore it under Settings → Categories."
+          confirmLabel="Archive"
           onCancel={() => setArchiving(null)}
           onConfirm={async () => {
-            const categoryId = archiving.categoryId;
+            const { categoryId, name } = archiving;
+            await api.archiveCategory(householdId, categoryId);
             setArchiving(null);
-            await archive(categoryId);
+            await page.run(onChanged, { success: `${name} archived.` });
+          }}
+        />
+      )}
+
+      {releasing && (
+        <ConfirmDialog
+          title={`Release ${formatCents(releasing.rolloverCents)} from ${releasing.name}?`}
+          body="The leftover above this month's target goes back to Left to allocate. The envelope keeps its planned amount."
+          confirmLabel="Release"
+          danger={false}
+          onCancel={() => setReleasing(null)}
+          onConfirm={async () => {
+            const { envelope, name, rolloverCents } = releasing;
+            await api.allocateToEnvelope(householdId, envelope.id, { month: currentMonth(), amountCents: -rolloverCents, note: "Released unspent funds" });
+            setReleasing(null);
+            await page.run(onChanged, { success: `${formatCents(rolloverCents)} released from ${name}.` });
           }}
         />
       )}
@@ -1307,7 +1241,7 @@ export function EnvelopesPage({
           body={`${rebuildArchiveTargets.length} existing envelope${rebuildArchiveTargets.length === 1 ? "" : "s"} will be archived, then ${
             suggestions.filter((_, i) => suggestChecked[i]).length
           } new one${suggestions.filter((_, i) => suggestChecked[i]).length === 1 ? "" : "s"} created. Bills and income aren't affected.`}
-          confirmLabel="Rebuild the plan"
+          confirmLabel="Rebuild"
           onCancel={() => setConfirmingRebuild(false)}
           onConfirm={rebuildFromSuggestions}
         />

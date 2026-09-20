@@ -1,8 +1,11 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import { errorMessage } from "../api";
 import { Modal } from "./ScheduleFields";
+import { Notice } from "./Notice";
 
 /**
- * The app's "are you sure?".
+ * The app's "are you sure?", used for every action that throws something
+ * away: deleting, archiving, removing, unlinking.
  *
  * It replaces window.confirm(), which cannot say what is about to happen
  * in more than one unstyled line, cannot show progress while the work
@@ -23,7 +26,7 @@ export function ConfirmDialog({
   onCancel,
 }: {
   title: string;
-  body: string;
+  body: ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
@@ -39,7 +42,7 @@ export function ConfirmDialog({
     try {
       await onConfirm();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "That didn't work");
+      setError(errorMessage(err));
       setBusy(false);
     }
   }
@@ -60,8 +63,8 @@ export function ConfirmDialog({
         </>
       }
     >
-      <p style={{ margin: 0, lineHeight: 1.55 }}>{body}</p>
-      {error && <p className="error">{error}</p>}
+      {typeof body === "string" ? <p style={{ margin: 0, lineHeight: 1.55 }}>{body}</p> : body}
+      <Notice notice={error ? { kind: "error", text: error } : null} />
     </Modal>
   );
 }

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
 import { api, type Account, type CsvImportSummary } from "../api";
+import { Notice, useAction } from "./Notice";
 
 interface Props {
   householdId: string;
@@ -58,9 +59,9 @@ export function ImportSection({ householdId, accounts, onChanged }: Props) {
     category: "",
     memo: "",
   });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<CsvImportSummary | null>(null);
+  const action = useAction();
+  const busy = action.busy;
 
   useEffect(() => {
     setAccountId((prev) => (prev && accounts.some((a) => a.id === prev) ? prev : accounts[0]?.id ?? ""));
@@ -71,7 +72,7 @@ export function ImportSection({ householdId, accounts, onChanged }: Props) {
     if (!file) return;
     setFileName(file.name);
     setSummary(null);
-    setError(null);
+    action.clear();
     const text = await file.text();
     setCsvText(text);
     const detected = parseHeaderRow(text);
@@ -93,11 +94,10 @@ export function ImportSection({ householdId, accounts, onChanged }: Props) {
   async function submit(e: FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
-    setBusy(true);
-    setError(null);
     setSummary(null);
-    try {
-      const result = await api.importCsv(householdId, {
+    let result: CsvImportSummary | null = null;
+    const ok = await action.run(async () => {
+      result = await api.importCsv(householdId, {
         accountId,
         csv: csvText,
         columnMapping: {
@@ -108,13 +108,9 @@ export function ImportSection({ householdId, accounts, onChanged }: Props) {
           memo: mapping.memo || undefined,
         },
       });
-      setSummary(result);
       await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed");
-    } finally {
-      setBusy(false);
-    }
+    });
+    if (ok) setSummary(result);
   }
 
   return (
@@ -178,16 +174,18 @@ export function ImportSection({ householdId, accounts, onChanged }: Props) {
         </button>
       </form>
 
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} style={{ marginTop: 12 }} />
       {summary && (
-        <p className="hint">
-          Imported {summary.imported}, skipped {summary.skippedDuplicates} duplicate
-          {summary.skippedDuplicates === 1 ? "" : "s"}
-          {summary.unmatchedCategoryNames.length > 0 && (
-            <> — unmatched categories: {summary.unmatchedCategoryNames.join(", ")}</>
-          )}
-          .
-        </p>
+        <Notice
+          style={{ marginTop: 12 }}
+          notice={{
+            kind: "success",
+            text: `Imported ${summary.imported} transaction${summary.imported === 1 ? "" : "s"} and skipped ${summary.skippedDuplicates} duplicate${
+              summary.skippedDuplicates === 1 ? "" : "s"
+            }.${summary.unmatchedCategoryNames.length > 0 ? ` No category matched: ${summary.unmatchedCategoryNames.join(", ")}.` : ""}`,
+          }}
+          onDismiss={() => setSummary(null)}
+        />
       )}
     </section>
   );

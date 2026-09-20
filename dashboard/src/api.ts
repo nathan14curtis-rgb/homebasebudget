@@ -4,20 +4,100 @@
  * local `wrangler dev` in `npm run dev` (see vite.config.ts).
  */
 
+/** What a field name in a server validation message means to a person. */
+const FIELD_WORDS: Record<string, string> = {
+  name: "a name",
+  accountId: "an account",
+  categoryId: "a category",
+  postedAt: "a date",
+  amountCents: "an amount",
+  description: "a description",
+  phoneE164: "a phone number",
+  userId: "a person",
+  verifiedByUserId: "a person",
+  task: "a task",
+  dueDate: "a due date",
+  assetId: "an asset",
+  merchantPattern: "a merchant",
+  month: "a month",
+  newCategoryName: "a name",
+  csv: "a CSV file",
+  columnMapping: "the column mapping",
+  code: "the code",
+  householdName: "a household name",
+  creatorName: "your name",
+};
+
+function sentence(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+  const capitalized = trimmed[0]!.toUpperCase() + trimmed.slice(1);
+  return /[.!?]$/.test(capitalized) ? capitalized : `${capitalized}.`;
+}
+
+/**
+ * Turns the server's developer-facing error ("categoryId is required",
+ * "phoneE164 must be E.164, e.g. +13035551234") into a sentence a person
+ * can act on. Every page shows `err.message` directly, so this is the one
+ * place the wording is decided.
+ */
+export function describeApiError(status: number, body: unknown): string {
+  const raw = typeof body === "object" && body !== null && typeof (body as { error?: unknown }).error === "string" ? (body as { error: string }).error : null;
+
+  if (raw) {
+    if (raw === "not logged in") return "You're logged out. Reload the page to log in again.";
+    if (raw === "That code is invalid or has expired.") return raw;
+    if (raw === "categoryId or newCategoryName is required") return "Pick a category, or give it a new name.";
+    if (raw.startsWith("phoneE164")) return "Enter a 10-digit US phone number, like (303) 555-1234.";
+    if (raw.startsWith("splits must be")) return "A split needs at least two lines, each with an amount and a category.";
+    if (raw.includes("amountCents") && raw.includes("non-zero")) return "Enter an amount other than zero.";
+    const required = raw.match(/^(\w+) is required$/);
+    if (required) return `Enter ${FIELD_WORDS[required[1]!] ?? required[1]}.`;
+    const oneOf = raw.match(/^(\w+) must be one of (.+)$/);
+    if (oneOf) return `Choose ${FIELD_WORDS[oneOf[1]!] ?? oneOf[1]} from the options given.`;
+    const mustBe = raw.match(/^(\w+)( query param)? must be (.+)$/);
+    if (mustBe) return `The ${FIELD_WORDS[mustBe[1]!]?.replace(/^(a|an|the|your) /, "") ?? mustBe[1]} should be ${mustBe[3]}.`;
+    if (/not found$/.test(raw)) return "That's no longer here. Reload the page and try again.";
+    if (/not configured$/.test(raw)) return "That isn't set up on this deployment yet.";
+    if (status < 500) return sentence(raw);
+  }
+
+  if (status === 0) return "Couldn't reach the server. Check your connection and try again.";
+  if (status === 401) return "You're logged out. Reload the page to log in again.";
+  if (status === 403) return "You don't have permission to do that.";
+  if (status === 404) return "That's no longer here. Reload the page and try again.";
+  if (status === 409) return "That clashes with something that already exists.";
+  if (status === 413) return "That's too large to send.";
+  if (status >= 500) return "Something went wrong on the server. Try again in a moment.";
+  return "That didn't work. Try again.";
+}
+
 export class ApiError extends Error {
+  /** The server's own wording, for logs and the console; `message` is the person-facing version. */
+  public detail: string;
   constructor(public status: number, public body: unknown) {
-    // The Worker's routes answer with { error: "…" } written for a person;
-    // show that, and fall back to the raw status only when there isn't one.
-    const message = body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string" ? (body as { error: string }).error : null;
-    super(message ?? `API error ${status}: ${JSON.stringify(body)}`);
+    super(describeApiError(status, body));
+    this.name = "ApiError";
+    this.detail = `API error ${status}: ${JSON.stringify(body)}`;
   }
 }
 
+/** The one way a page turns a thrown value into words for a person. */
+export function errorMessage(err: unknown, fallback = "That didn't work. Try again."): string {
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    ...init,
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
+  let response: Response;
+  try {
+    response = await fetch(`/api${path}`, {
+      ...init,
+      headers: { "content-type": "application/json", ...init?.headers },
+    });
+  } catch {
+    throw new ApiError(0, null);
+  }
   const body = await response.json().catch(() => null);
   if (!response.ok) throw new ApiError(response.status, body);
   return body as T;

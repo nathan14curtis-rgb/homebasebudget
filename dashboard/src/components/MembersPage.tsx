@@ -1,6 +1,13 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useMemo, useState } from "react";
 import { api, type Account, type AccessLevel, type Transaction, type User } from "../api";
 import { currentMonth, formatCents } from "../format";
+import { parseMoney, moneyToInput } from "../money";
+import { usePageAction } from "../pageAction";
+import { VALIDATION } from "../copy";
+import { Modal } from "./ScheduleFields";
+import { MoneyInput } from "./MoneyInput";
+import { Notice, useAction } from "./Notice";
+import { EmptyState } from "./EmptyState";
 
 interface Props {
   householdId: string;
@@ -10,21 +17,103 @@ interface Props {
   onChanged: () => Promise<void>;
 }
 
-const ACCESS_LABEL: Record<AccessLevel, string> = { full: "full", limited: "limited", view_only: "view only" };
-const ACCESS_BADGE_CLASS: Record<AccessLevel, string> = { full: "badge", limited: "badge", view_only: "badge badge--muted" };
+const ACCESS_LABEL: Record<AccessLevel, string> = { full: "Full access", limited: "Limited", view_only: "View only" };
+const ACCESS_BADGE_CLASS: Record<AccessLevel, string> = { full: "badge badge--soft", limited: "badge badge--soft", view_only: "badge badge--soft badge--muted" };
 
-interface EditDraft {
-  role: string;
-  accessLevel: AccessLevel;
-  weeklyAllowance: string;
-  note: string;
+/** Add and edit are the same questions, so they are one dialog. */
+function MemberModal({ householdId, user, onClose, onSaved }: { householdId: string; user?: User; onClose: () => void; onSaved: () => Promise<void> }) {
+  const editing = Boolean(user);
+  const [name, setName] = useState(user?.name ?? "");
+  const [role, setRole] = useState(user?.role ?? "");
+  const [accessLevel, setAccessLevel] = useState<AccessLevel>(user?.access_level ?? "full");
+  const [weeklyAllowance, setWeeklyAllowance] = useState(moneyToInput(user?.weekly_allowance_cents ?? null));
+  const [note, setNote] = useState(user?.note ?? "");
+  const action = useAction();
+
+  async function save() {
+    const trimmedName = name.trim();
+    if (!trimmedName) return action.showError(VALIDATION.name);
+    const allowanceCents = weeklyAllowance.trim() ? parseMoney(weeklyAllowance) : null;
+    if (weeklyAllowance.trim() && allowanceCents === null) return action.showError(VALIDATION.amount);
+    const ok = await action.run(async () => {
+      if (user) {
+        await api.updateUser(householdId, user.id, {
+          role: role.trim() || null,
+          accessLevel,
+          weeklyAllowanceCents: allowanceCents,
+          note: note.trim() || null,
+        });
+      } else {
+        await api.createUser(householdId, { name: trimmedName, role: role.trim() || undefined });
+      }
+      await onSaved();
+    });
+    if (ok) onClose();
+  }
+
+  return (
+    <Modal
+      title={editing ? `Edit ${user!.name}` : "Add member"}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="secondary" onClick={onClose} disabled={action.busy}>
+            Cancel
+          </button>
+          <button type="button" onClick={save} disabled={action.busy}>
+            {action.busy ? "Saving…" : editing ? "Save" : "Add member"}
+          </button>
+        </>
+      }
+    >
+      {!editing && (
+        <div className="field">
+          <label htmlFor="member-name">Name</label>
+          <input id="member-name" type="text" data-autofocus="true" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+      )}
+      <div className="field">
+        <label htmlFor="member-role">Role</label>
+        <input
+          id="member-role"
+          type="text"
+          data-autofocus={editing ? "true" : undefined}
+          placeholder="e.g. Parent, or Age 16"
+          value={role}
+          onChange={(e) => setRole(e.target.value)}
+        />
+      </div>
+      {editing && (
+        <>
+          <div className="field">
+            <label htmlFor="member-access">What they can change by text</label>
+            <select id="member-access" value={accessLevel} onChange={(e) => setAccessLevel(e.target.value as AccessLevel)}>
+              <option value="full">Full access — anything</option>
+              <option value="limited">Limited — categorize and tag, but not re-plan</option>
+              <option value="view_only">View only — ask anything, change nothing</option>
+            </select>
+          </div>
+          <div className="field">
+            <label htmlFor="member-allowance">Weekly allowance</label>
+            <MoneyInput id="member-allowance" value={weeklyAllowance} onChange={setWeeklyAllowance} disabled={action.busy} placeholder="None" />
+          </div>
+          <div className="field">
+            <label htmlFor="member-note">Note</label>
+            <input id="member-note" type="text" value={note} onChange={(e) => setNote(e.target.value)} />
+          </div>
+        </>
+      )}
+      {!editing && <p className="hint">Access level, allowance and a note can be set once they're added. Their phone number is verified from Settings.</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} />
+    </Modal>
+  );
 }
 
 export function MembersPage({ householdId, users, accounts, transactions, onChanged }: Props) {
-  const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState<Record<string, EditDraft>>({});
-  const [newName, setNewName] = useState("");
-  const [newRole, setNewRole] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<User | null>(null);
+
+  usePageAction("Add member", () => setAdding(true));
 
   const month = currentMonth();
   const spentByUser = useMemo(() => {
@@ -39,58 +128,11 @@ export function MembersPage({ householdId, users, accounts, transactions, onChan
     return totals;
   }, [accounts, transactions, month]);
 
-  function startEdit(u: User) {
-    setEditing((prev) => ({
-      ...prev,
-      [u.id]: {
-        role: u.role ?? "",
-        accessLevel: u.access_level,
-        weeklyAllowance: u.weekly_allowance_cents ? (u.weekly_allowance_cents / 100).toString() : "",
-        note: u.note ?? "",
-      },
-    }));
-  }
-
-  async function saveEdit(userId: string) {
-    const draft = editing[userId];
-    if (!draft) return;
-    setError(null);
-    try {
-      await api.updateUser(householdId, userId, {
-        role: draft.role.trim() || null,
-        accessLevel: draft.accessLevel,
-        weeklyAllowanceCents: draft.weeklyAllowance.trim() ? Math.round(Number(draft.weeklyAllowance) * 100) : null,
-        note: draft.note.trim() || null,
-      });
-      setEditing((prev) => {
-        const { [userId]: _, ...rest } = prev;
-        return rest;
-      });
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update member");
-    }
-  }
-
-  async function inviteMember(e: FormEvent) {
-    e.preventDefault();
-    setError(null);
-    try {
-      await api.createUser(householdId, { name: newName.trim(), role: newRole.trim() || undefined });
-      setNewName("");
-      setNewRole("");
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to invite member");
-    }
-  }
-
   return (
     <div className="section">
-      <div className="grid-2">
-        {users.map((u) => {
-          const draft = editing[u.id];
-          return (
+      {users.length > 0 ? (
+        <div className="grid-2">
+          {users.map((u) => (
             <div className="card card--padded" key={u.id} style={{ display: "flex", flexDirection: "column", gap: 20 }}>
               <div className="row" style={{ gap: 16, alignItems: "center" }}>
                 <span className="row-avatar" style={{ width: 48, height: 48, fontSize: 16 }}>
@@ -119,62 +161,24 @@ export function MembersPage({ householdId, users, accounts, transactions, onChan
                 </div>
               </div>
 
-              {u.note && !draft && <span style={{ fontSize: 14, color: "var(--body-text)" }}>{u.note}</span>}
+              {u.note && <span style={{ fontSize: 14, color: "var(--body-text)" }}>{u.note}</span>}
 
-              {draft ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  <div className="row">
-                    <input type="text" placeholder="Role (e.g. Parent · admin)" value={draft.role} onChange={(e) => setEditing((p) => ({ ...p, [u.id]: { ...draft, role: e.target.value } }))} style={{ flex: 1 }} />
-                    <select value={draft.accessLevel} onChange={(e) => setEditing((p) => ({ ...p, [u.id]: { ...draft, accessLevel: e.target.value as AccessLevel } }))}>
-                      <option value="full">Full access</option>
-                      <option value="limited">Limited access</option>
-                      <option value="view_only">View only</option>
-                    </select>
-                  </div>
-                  <div className="row">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      placeholder="Weekly allowance $"
-                      value={draft.weeklyAllowance}
-                      onChange={(e) => setEditing((p) => ({ ...p, [u.id]: { ...draft, weeklyAllowance: e.target.value } }))}
-                      style={{ width: 160 }}
-                    />
-                    <input
-                      type="text"
-                      placeholder="Note"
-                      value={draft.note}
-                      onChange={(e) => setEditing((p) => ({ ...p, [u.id]: { ...draft, note: e.target.value } }))}
-                      style={{ flex: 1 }}
-                    />
-                  </div>
-                  <button className="secondary" onClick={() => saveEdit(u.id)} style={{ alignSelf: "flex-start" }}>
-                    Save
-                  </button>
-                </div>
-              ) : (
-                <button className="secondary" onClick={() => startEdit(u)} style={{ alignSelf: "flex-start" }}>
-                  Edit
-                </button>
-              )}
+              <button className="secondary" type="button" onClick={() => setEditing(u)} style={{ alignSelf: "flex-start" }}>
+                Edit
+              </button>
             </div>
-          );
-        })}
-        {users.length === 0 && <p className="hint">No members yet — invite one below.</p>}
-      </div>
+          ))}
+        </div>
+      ) : (
+        <EmptyState title="No members yet" hint="Everyone in the household shares one ledger. Invite the first person to get started.">
+          <button type="button" onClick={() => setAdding(true)}>
+            Add member
+          </button>
+        </EmptyState>
+      )}
 
-      <section className="card card--padded" id="page-add-form">
-        <h2>Invite member</h2>
-        <form onSubmit={inviteMember}>
-          <div className="row">
-            <input type="text" placeholder="Name" value={newName} onChange={(e) => setNewName(e.target.value)} required style={{ flex: 1 }} />
-            <input type="text" placeholder="Role (e.g. Age 16)" value={newRole} onChange={(e) => setNewRole(e.target.value)} style={{ width: 180 }} />
-            <button type="submit">Invite</button>
-          </div>
-        </form>
-      </section>
-
-      {error && <p className="error">{error}</p>}
+      {adding && <MemberModal householdId={householdId} onClose={() => setAdding(false)} onSaved={onChanged} />}
+      {editing && <MemberModal householdId={householdId} user={editing} onClose={() => setEditing(null)} onSaved={onChanged} />}
     </div>
   );
 }

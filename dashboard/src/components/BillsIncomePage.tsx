@@ -39,6 +39,11 @@ import {
 import { TransactionDetailModal } from "./TransactionDetailModal";
 import type { Recurring } from "../useRecurring";
 import { usePageAction } from "../pageAction";
+import { parseMoney, moneyToInput } from "../money";
+import { VALIDATION, seriesNoun } from "../copy";
+import { MoneyInput } from "./MoneyInput";
+import { Notice, useAction } from "./Notice";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface Props {
   householdId: string;
@@ -70,17 +75,13 @@ interface Tile {
 function tileStatusLabel(tile: Tile, today: string): string {
   if (tile.skipped) return "Skipped";
   if (tile.settled) return tile.isIncome ? "Received" : "Paid";
-  if (tile.occurrence.due_date < today) return tile.isIncome ? "Not received yet" : "Overdue";
+  if (tile.occurrence.due_date < today)
+    return tile.isIncome ? "Not received yet" : "Overdue";
   return tile.isIncome ? "Expected" : "Due";
 }
 
 function centsToInput(cents: number): string {
-  return (Math.abs(cents) / 100).toFixed(2);
-}
-
-function inputToCents(value: string): number | null {
-  const cents = Math.round(Number(value) * 100);
-  return Number.isFinite(cents) ? Math.abs(cents) : null;
+  return moneyToInput(cents);
 }
 
 /* ------------------------------------------------------------------ */
@@ -119,35 +120,59 @@ function SeriesFormModal({
   onSaved: () => Promise<void>;
 }) {
   const editing = Boolean(pattern);
-  const existingCategory = pattern ? categories.find((c) => c.id === pattern.category_id) : undefined;
-  const existingEnvelope = pattern ? envelopes.find((e) => e.category_id === pattern.category_id) : undefined;
-  // A detected series has no category yet — "Add to calendar" is the
-  // moment it gets one, which is what turns a suggestion into a bill.
+  // A detected series arrives as a suggestion with no category of its own.
+  // "Add to calendar" is what confirms it — a PATCH alone leaves it
+  // suggested, and a suggested series projects nothing.
   const confirming = pattern?.status === "suggested";
-  // Adding, or confirming a suggestion: the name is a category to pick or
-  // create. Editing a series that already has one: the name is that
-  // category's, and typing a new one renames it.
+  const existingCategory = pattern
+    ? categories.find((c) => c.id === pattern.category_id)
+    : undefined;
+  // A series that already has a category is renamed in place; only a new
+  // or still-unfiled one gets to pick between "name a new one" and "use
+  // one that exists".
   const choosingCategory = !existingCategory;
+  const existingEnvelope = pattern
+    ? envelopes.find((e) => e.category_id === pattern.category_id)
+    : undefined;
 
-  const [kind, setKind] = useState<"expense" | "income">(pattern?.kind ?? "expense");
+  const [kind, setKind] = useState<"expense" | "income">(
+    pattern?.kind ?? "expense",
+  );
   const [nameMode, setNameMode] = useState<"new" | "existing">("new");
   const [newName, setNewName] = useState("");
   const [renameTo, setRenameTo] = useState(existingCategory?.name ?? "");
   const [categoryId, setCategoryId] = useState(pattern?.category_id ?? "");
   const [amount, setAmount] = useState(() => {
-    const cents = pattern?.expected_amount_cents ?? existingEnvelope?.monthly_target_cents ?? null;
+    const cents =
+      pattern?.expected_amount_cents ??
+      existingEnvelope?.monthly_target_cents ??
+      null;
     return cents === null ? "" : centsToInput(cents);
   });
   const [schedule, setSchedule] = useState<ScheduleState>(() =>
-    pattern ? scheduleFromPattern(pattern) : defaultDate ? scheduleFromDate(defaultDate) : defaultSchedule(),
+    pattern
+      ? scheduleFromPattern(pattern)
+      : defaultDate
+        ? scheduleFromDate(defaultDate)
+        : defaultSchedule(),
   );
-  const [merchantPattern, setMerchantPattern] = useState(pattern?.merchant_pattern ?? "");
+  const [merchantPattern, setMerchantPattern] = useState(
+    pattern?.merchant_pattern ?? "",
+  );
   const [merchantSearch, setMerchantSearch] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const action = useAction();
+  const saving = action.busy;
+  const noun = seriesNoun(kind === "income");
 
   const selectableCategories = useMemo(
-    () => categories.filter((c) => !c.archived_at && (kind === "income" ? c.kind === "income" : c.kind === "expense")).sort((a, b) => a.name.localeCompare(b.name)),
+    () =>
+      categories
+        .filter(
+          (c) =>
+            !c.archived_at &&
+            (kind === "income" ? c.kind === "income" : c.kind === "expense"),
+        )
+        .sort((a, b) => a.name.localeCompare(b.name)),
     [categories, kind],
   );
 
@@ -161,9 +186,11 @@ function SeriesFormModal({
     const results: Transaction[] = [];
     for (const t of transactions) {
       if (t.is_transfer) continue;
-      if (kind === "income" ? t.amount_cents <= 0 : t.amount_cents >= 0) continue;
+      if (kind === "income" ? t.amount_cents <= 0 : t.amount_cents >= 0)
+        continue;
       const merchant = t.normalized_merchant ?? t.raw_description;
-      if (!merchant.toLowerCase().includes(needle) || seen.has(merchant)) continue;
+      if (!merchant.toLowerCase().includes(needle) || seen.has(merchant))
+        continue;
       seen.add(merchant);
       results.push(t);
       if (results.length >= 6) break;
@@ -177,93 +204,131 @@ function SeriesFormModal({
     if (!amount.trim()) setAmount(centsToInput(t.amount_cents));
   }
 
+  function chosenName() {
+    if (!choosingCategory) return renameTo.trim();
+    return nameMode === "new"
+      ? newName.trim()
+      : (selectableCategories.find((c) => c.id === categoryId)?.name ?? "");
+  }
+
   async function save() {
-    const noun = kind === "income" ? "deposit" : "bill";
-    let name: string;
-    let chosenCategoryId: string | undefined;
-    if (choosingCategory) {
-      name = nameMode === "new" ? newName.trim() : (selectableCategories.find((c) => c.id === categoryId)?.name ?? "");
-      if (nameMode === "new" && !name) return setError(`Give this ${noun} a name`);
-      if (nameMode === "existing" && !categoryId) return setError("Choose a category");
-      // A typed name that is already a category is that category — a
-      // second "Utilities" would never link to the charges the first
-      // one already has.
-      const sameName = nameMode === "new" ? selectableCategories.find((c) => c.name.trim().toLowerCase() === name.toLowerCase()) : undefined;
-      chosenCategoryId = nameMode === "existing" ? categoryId : sameName?.id;
-    } else {
-      name = renameTo.trim();
-      if (!name) return setError(`Give this ${noun} a name`);
-    }
-    if (!scheduleIsValid(schedule)) return setError("Fill in when it repeats");
-    const amountCents = amount.trim() ? inputToCents(amount) : null;
-    if (amount.trim() && amountCents === null) return setError("Enter a valid amount");
+    const name = chosenName();
+    if (!name) return action.showError(`Give this ${noun} a name.`);
+    if (choosingCategory && nameMode === "existing" && !categoryId)
+      return action.showError(VALIDATION.category);
+    if (!scheduleIsValid(schedule))
+      return action.showError("Fill in when it repeats.");
+    const amountCents = amount.trim() ? parseMoney(amount) : null;
+    if (amount.trim() && amountCents === null)
+      return action.showError(VALIDATION.amount);
+
+    const ok = await action.run(async () => {
+      try {
+        await write();
+      } catch (err) {
+        throw new Error(
+          describeRecurringPatternError(err, "Couldn't save this series."),
+        );
+      }
+      await onSaved();
+    });
+    if (ok) onClose();
+  }
+
+  async function write() {
+    const name = chosenName();
+    const amountCents = amount.trim() ? parseMoney(amount) : null;
     // The merchant defaults to the name so a hand-entered bill still
     // auto-matches when it eventually shows up on a statement.
     const merchant = merchantPattern.trim() || pattern?.merchant_pattern || name;
+    // When naming a new category, a name that already exists (case aside)
+    // is that category — the server refuses a duplicate name, and a second
+    // "Electric" would never link to the charges filed under the first.
+    const sameName = selectableCategories.find(
+      (c) => c.name.trim().toLowerCase() === name.toLowerCase(),
+    );
+    const chosenCategoryId = !choosingCategory
+      ? existingCategory?.id
+      : nameMode === "existing"
+        ? categoryId
+        : sameName?.id;
+    const schedulePart = scheduleToApiInput(schedule);
 
-    setSaving(true);
-    setError(null);
-    try {
-      if (pattern && confirming) {
-        // One request: confirm (which is what puts it on the calendar) with
-        // the category, amount and schedule corrected here. The server
-        // groups the category's envelope under Bills and mirrors the amount.
-        await api.confirmRecurringPattern(householdId, pattern.id, {
-          categoryId: chosenCategoryId,
-          newCategoryName: chosenCategoryId ? undefined : name,
-          kind,
-          merchantPattern: merchant,
-          expectedAmountCents: amountCents,
-          ...scheduleToApiInput(schedule),
-        });
-      } else if (pattern) {
-        await api.updateRecurringPattern(householdId, pattern.id, {
-          merchantPattern: merchant,
-          expectedAmountCents: amountCents,
-          ...scheduleToApiInput(schedule),
-        });
-        if (existingCategory && name !== existingCategory.name) {
-          await api.renameCategory(householdId, existingCategory.id, name);
-        }
-      } else {
-        await api.createRecurringPattern(householdId, {
-          merchantPattern: merchant,
-          kind,
-          categoryId: chosenCategoryId,
-          newCategoryName: chosenCategoryId ? undefined : name,
-          monthlyTargetCents: kind === "expense" && amountCents !== null ? amountCents : undefined,
-          expectedAmountCents: amountCents ?? undefined,
-          ...scheduleToApiInput(schedule),
-        });
+    if (pattern && confirming) {
+      // Confirm and set everything in one call; the server files the
+      // series under its category and brings the envelope in step.
+      await api.confirmRecurringPattern(householdId, pattern.id, {
+        categoryId: chosenCategoryId,
+        newCategoryName: chosenCategoryId ? undefined : name,
+        kind,
+        merchantPattern: merchant,
+        expectedAmountCents: amountCents,
+        ...schedulePart,
+      });
+    } else if (pattern) {
+      // The server re-seeds the projected months and mirrors the amount to
+      // the envelope, so nothing has to be patched twice from here.
+      await api.updateRecurringPattern(householdId, pattern.id, {
+        merchantPattern: merchant,
+        expectedAmountCents: amountCents,
+        ...schedulePart,
+      });
+      if (existingCategory && name !== existingCategory.name) {
+        await api.renameCategory(householdId, existingCategory.id, name);
       }
-      await onSaved();
-      onClose();
-    } catch (err) {
-      setError(describeRecurringPatternError(err, "Failed to save"));
-      setSaving(false);
+    } else {
+      await api.createRecurringPattern(householdId, {
+        merchantPattern: merchant,
+        kind,
+        categoryId: chosenCategoryId,
+        newCategoryName: chosenCategoryId ? undefined : name,
+        monthlyTargetCents:
+          kind === "expense" && amountCents !== null ? amountCents : undefined,
+        expectedAmountCents: amountCents ?? undefined,
+        ...schedulePart,
+      });
     }
   }
 
-  const noun = kind === "income" ? "income" : "bill";
-
   return (
     <Modal
-      title={confirming ? `Add ${pattern?.merchant_pattern ?? "this"} to the calendar` : editing ? `Edit ${existingCategory?.name ?? "series"}` : "Add a bill or income"}
+      title={
+        confirming
+          ? `Add ${pattern?.merchant_pattern ?? "this"} to the calendar`
+          : editing
+            ? `Edit ${existingCategory?.name ?? "series"}`
+            : "Add a bill or income"
+      }
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="secondary" onClick={onClose} disabled={saving}>
+          <button
+            type="button"
+            className="secondary"
+            onClick={onClose}
+            disabled={saving}
+          >
             Cancel
           </button>
           <button type="button" onClick={save} disabled={saving}>
-            {saving ? "Saving…" : confirming ? "Add to calendar" : editing ? "Save changes" : `Add ${noun}`}
+            {saving
+              ? "Saving…"
+              : confirming
+                ? "Add to calendar"
+                : editing
+                  ? "Save"
+                  : `Add ${noun}`}
           </button>
         </>
       }
     >
       <div className="field">
         <label id="series-kind-label">Type</label>
-        <div className="segmented" role="radiogroup" aria-labelledby="series-kind-label">
+        <div
+          className="segmented"
+          role="radiogroup"
+          aria-labelledby="series-kind-label"
+        >
           <button
             type="button"
             role="radio"
@@ -285,15 +350,29 @@ function SeriesFormModal({
             Income
           </button>
         </div>
-        {editing && <p className="hint">A series can't change between a bill and income — delete it and add it the other way instead.</p>}
+        {editing && (
+          <p className="hint">
+            A series can't switch between bill and income. Delete it and add it
+            the other way instead.
+          </p>
+        )}
       </div>
 
       <div className="field">
         <label htmlFor="series-name">Name</label>
         {!choosingCategory ? (
           <>
-            <input id="series-name" type="text" data-autofocus="true" value={renameTo} onChange={(e) => setRenameTo(e.target.value)} />
-            <p className="hint">Also the name of its category and envelope — renaming here renames all three.</p>
+            <input
+              id="series-name"
+              type="text"
+              data-autofocus="true"
+              value={renameTo}
+              onChange={(e) => setRenameTo(e.target.value)}
+            />
+            <p className="hint">
+              Also the name of its category and envelope — renaming here
+              renames all three.
+            </p>
           </>
         ) : nameMode === "new" ? (
           <input
@@ -305,7 +384,12 @@ function SeriesFormModal({
             onChange={(e) => setNewName(e.target.value)}
           />
         ) : (
-          <select id="series-name" data-autofocus="true" value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
+          <select
+            id="series-name"
+            data-autofocus="true"
+            value={categoryId}
+            onChange={(e) => setCategoryId(e.target.value)}
+          >
             <option value="" disabled>
               Choose a category…
             </option>
@@ -320,33 +404,39 @@ function SeriesFormModal({
           <button
             type="button"
             className="link-button"
-            onClick={() => setNameMode((m) => (m === "new" ? "existing" : "new"))}
+            onClick={() =>
+              setNameMode((m) => (m === "new" ? "existing" : "new"))
+            }
             disabled={nameMode === "new" && selectableCategories.length === 0}
           >
-            {nameMode === "new" ? "Use an existing category instead" : "Create a new category instead"}
+            {nameMode === "new"
+              ? "Pick one that already exists instead"
+              : "Name a new one instead"}
           </button>
         )}
       </div>
 
       <div className="field">
         <label htmlFor="series-amount">Amount</label>
-        <div className="input-prefix">
-          <span aria-hidden>$</span>
-          <input
-            id="series-amount"
-            type="text"
-            inputMode="decimal"
-            placeholder="0.00"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-          />
-        </div>
-        <p className="hint">What you expect it to be. A month that comes in different can be corrected on the day itself.</p>
+        <MoneyInput
+          id="series-amount"
+          value={amount}
+          onChange={setAmount}
+          disabled={saving}
+        />
+        <p className="hint">
+          What you expect it to be. A month that comes in different can be
+          corrected on the day itself.
+        </p>
       </div>
 
       <div className="field">
         <label>Repeats</label>
-        <ScheduleFields value={schedule} onChange={setSchedule} idPrefix="series" />
+        <ScheduleFields
+          value={schedule}
+          onChange={setSchedule}
+          idPrefix="series"
+        />
       </div>
 
       <div className="field">
@@ -354,7 +444,11 @@ function SeriesFormModal({
         {merchantPattern ? (
           <div className="picked-value">
             <span className="money-label">{merchantPattern}</span>
-            <button type="button" className="secondary" onClick={() => setMerchantPattern("")}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setMerchantPattern("")}
+            >
               Change
             </button>
           </div>
@@ -370,9 +464,16 @@ function SeriesFormModal({
             {merchantCandidates.length > 0 && (
               <div className="row-list" style={{ marginTop: 8 }}>
                 {merchantCandidates.map((t) => (
-                  <button type="button" className="row-item row-item--button" key={t.id} onClick={() => pickMerchant(t)}>
+                  <button
+                    type="button"
+                    className="row-item row-item--button"
+                    key={t.id}
+                    onClick={() => pickMerchant(t)}
+                  >
                     <div className="row-figure" style={{ flex: "1 1 auto" }}>
-                      <span className="row-title">{t.normalized_merchant ?? t.raw_description}</span>
+                      <span className="row-title">
+                        {t.normalized_merchant ?? t.raw_description}
+                      </span>
                       <span className="row-meta">{t.posted_at}</span>
                     </div>
                     <span className="money">{formatCents(t.amount_cents)}</span>
@@ -382,10 +483,13 @@ function SeriesFormModal({
             )}
           </>
         )}
-        <p className="hint">Optional — it's how a real charge gets ticked off against this automatically. Left blank, the name is used.</p>
+        <p className="hint">
+          Optional. It's how a real charge gets ticked off against this
+          automatically. Left blank, the name is used.
+        </p>
       </div>
 
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} />
     </Modal>
   );
 }
@@ -429,38 +533,37 @@ function OccurrenceModal({
   }, [occurrence, pattern]);
   const [amount, setAmount] = useState(initialAmount);
   const [dueDate, setDueDate] = useState(occurrence.due_date);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmingUnlink, setConfirmingUnlink] = useState(false);
+  const action = useAction();
+  const saving = action.busy;
+  const noun = seriesNoun(tile.isIncome);
 
-  async function run(work: () => Promise<unknown>, failure: string) {
-    setSaving(true);
-    setError(null);
-    try {
+  async function run(work: () => Promise<unknown>) {
+    const ok = await action.run(async () => {
       await work();
       await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : failure);
-      setSaving(false);
-    }
+    });
+    if (ok) onClose();
   }
 
   function saveThisMonth() {
     const trimmed = amount.trim();
-    const amountOverrideCents = trimmed === "" ? null : inputToCents(trimmed);
+    const amountOverrideCents = trimmed === "" ? null : parseMoney(trimmed);
     if (trimmed !== "" && amountOverrideCents === null) {
-      setError("Enter a valid amount, or clear it to go back to what the series expects");
+      action.showError(
+        "Enter a valid amount, or clear it to go back to what the series expects.",
+      );
       return;
     }
-    // Only an amount the person actually changed becomes an override.
-    // Sending the pre-filled figure back would pin this square to today's
-    // projection, so a later series edit (or the real charge) could never
-    // move it.
+    // An untouched amount is not an override. Sending one anyway pinned the
+    // expected amount over what the statement later showed.
     const amountChanged = trimmed !== initialAmount.trim();
-    void run(
-      () => api.updateOccurrence(householdId, occurrence.id, { ...(amountChanged ? { amountOverrideCents } : {}), dueDate }),
-      "Failed to save",
+    void run(() =>
+      api.updateOccurrence(householdId, occurrence.id, {
+        ...(amountChanged ? { amountOverrideCents } : {}),
+        dueDate,
+      }),
     );
   }
 
@@ -470,30 +573,54 @@ function OccurrenceModal({
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="secondary" onClick={onClose} disabled={saving}>
+          <button
+            type="button"
+            className="secondary"
+            onClick={onClose}
+            disabled={saving}
+          >
             Cancel
           </button>
-          <button type="button" onClick={saveThisMonth} disabled={saving || tile.settled}>
-            {saving ? "Saving…" : "Save this month"}
+          <button
+            type="button"
+            onClick={saveThisMonth}
+            disabled={saving || tile.settled}
+          >
+            {saving ? "Saving…" : "Save"}
           </button>
         </>
       }
     >
       <div className="row" style={{ gap: 8 }}>
-        <span className={`badge badge--soft ${tile.isIncome ? "badge--positive" : "badge--muted"}`}>{tile.isIncome ? "Income" : "Bill"}</span>
-        <span className="badge badge--soft badge--muted">{tileStatusLabel(tile, today)}</span>
-        <span className="hint" style={{ margin: 0 }}>{dateLabel(occurrence.due_date)}</span>
+        <span
+          className={`badge badge--soft ${tile.isIncome ? "badge--positive" : "badge--muted"}`}
+        >
+          {tile.isIncome ? "Income" : "Bill"}
+        </span>
+        <span className="badge badge--soft badge--muted">
+          {tileStatusLabel(tile, today)}
+        </span>
+        <span className="hint" style={{ margin: 0 }}>
+          {dateLabel(occurrence.due_date)}
+        </span>
       </div>
 
       {tile.settled ? (
         <div className="callout">
           <p style={{ margin: 0 }}>
-            {tile.isIncome ? "Received" : "Paid"} — {matchedTransaction ? formatCents(Math.abs(matchedTransaction.amount_cents)) : formatCents(tile.amountCents ?? 0)}
+            {tile.isIncome ? "Received" : "Paid"} —{" "}
+            {matchedTransaction
+              ? formatCents(Math.abs(matchedTransaction.amount_cents))
+              : formatCents(tile.amountCents ?? 0)}
             {matchedTransaction ? ` on ${matchedTransaction.posted_at}` : ""}.
           </p>
           <div className="row" style={{ gap: 8, marginTop: 10 }}>
             {matchedTransaction && (
-              <button type="button" className="secondary" onClick={() => onOpenTransaction(matchedTransaction)}>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => onOpenTransaction(matchedTransaction)}
+              >
                 Open the transaction
               </button>
             )}
@@ -501,9 +628,9 @@ function OccurrenceModal({
               type="button"
               className="secondary"
               disabled={saving}
-              onClick={() => void run(() => api.unlinkOccurrence(householdId, occurrence.id), "Failed to unlink")}
+              onClick={() => setConfirmingUnlink(true)}
             >
-              This isn't it — unlink
+              This isn't it. Unlink
             </button>
           </div>
         </div>
@@ -512,39 +639,51 @@ function OccurrenceModal({
           <div className="row" style={{ gap: 12, alignItems: "flex-end" }}>
             <div className="field" style={{ margin: 0 }}>
               <label htmlFor="occ-amount">Amount this month</label>
-              <div className="input-prefix">
-                <span aria-hidden>$</span>
-                <input
-                  id="occ-amount"
-                  type="text"
-                  inputMode="decimal"
-                  data-autofocus="true"
-                  placeholder="From the series"
-                  value={amount}
-                  disabled={saving}
-                  onChange={(e) => setAmount(e.target.value)}
-                />
-              </div>
+              <MoneyInput
+                id="occ-amount"
+                value={amount}
+                onChange={setAmount}
+                disabled={saving}
+                autoFocus
+                placeholder="From the series"
+              />
             </div>
             <div className="field" style={{ margin: 0 }}>
-              <label htmlFor="occ-due">{tile.isIncome ? "Expected on" : "Due on"}</label>
-              <input id="occ-due" type="date" value={dueDate} disabled={saving} onChange={(e) => setDueDate(e.target.value)} />
+              <label htmlFor="occ-due">
+                {tile.isIncome ? "Expected on" : "Due on"}
+              </label>
+              <input
+                id="occ-due"
+                type="date"
+                value={dueDate}
+                disabled={saving}
+                onChange={(e) => setDueDate(e.target.value)}
+              />
             </div>
           </div>
-          <p className="hint">Only this one — the series keeps expecting {pattern?.expected_amount_cents ? formatCents(Math.abs(pattern.expected_amount_cents)) : "whatever it has been"}. Clear the amount to go back to that.</p>
+          <p className="hint">
+            Only this one. The series keeps expecting{" "}
+            {pattern?.expected_amount_cents
+              ? formatCents(Math.abs(pattern.expected_amount_cents))
+              : "whatever it has been"}
+            . Clear the amount to go back to that.
+          </p>
 
           <button
             type="button"
             className="secondary"
             disabled={saving}
             onClick={() =>
-              void run(
-                () => api.updateOccurrence(householdId, occurrence.id, { status: tile.skipped ? "upcoming" : "skipped" }),
-                "Failed to save",
+              void run(() =>
+                api.updateOccurrence(householdId, occurrence.id, {
+                  status: tile.skipped ? "upcoming" : "skipped",
+                }),
               )
             }
           >
-            {tile.skipped ? "Put this one back" : `Skip just this ${tile.isIncome ? "deposit" : "bill"}`}
+            {tile.skipped
+              ? "Put this one back"
+              : `Skip this one ${noun === "bill" ? "bill" : "payment"}`}
           </button>
         </>
       )}
@@ -556,43 +695,63 @@ function OccurrenceModal({
           <h4 className="subhead">The series</h4>
           <p className="hint" style={{ margin: 0 }}>
             {pattern ? scheduleLabel(pattern) : "Recurring"}
-            {pattern?.merchant_pattern ? ` · matches “${pattern.merchant_pattern}”` : ""}
+            {pattern?.merchant_pattern
+              ? ` · matches “${pattern.merchant_pattern}”`
+              : ""}
           </p>
         </div>
         <div className="row" style={{ gap: 8 }}>
-          <button type="button" className="secondary" onClick={onEditSeries} disabled={saving || !pattern}>
-            Edit every {tile.isIncome ? "deposit" : "bill"}
+          <button
+            type="button"
+            className="secondary"
+            onClick={onEditSeries}
+            disabled={saving || !pattern}
+          >
+            Edit the series
           </button>
-          {pattern && !confirmingDelete && (
-            <button type="button" className="danger" onClick={() => setConfirmingDelete(true)} disabled={saving}>
-              Delete series
+          {pattern && (
+            <button
+              type="button"
+              className="danger"
+              onClick={() => setConfirmingDelete(true)}
+              disabled={saving}
+            >
+              Delete the series
             </button>
           )}
         </div>
-        {confirmingDelete && pattern && (
-          <div className="callout callout--danger">
-            <p style={{ margin: 0 }}>
-              Delete “{tile.name}” and every square it puts on the calendar? Transactions that already posted stay where they are; the
-              category and its envelope stay too.
-            </p>
-            <div className="row" style={{ gap: 8, marginTop: 10 }}>
-              <button type="button" className="secondary" onClick={() => setConfirmingDelete(false)} disabled={saving}>
-                Keep it
-              </button>
-              <button
-                type="button"
-                className="danger"
-                disabled={saving}
-                onClick={() => void run(() => api.deleteRecurringPattern(householdId, pattern.id), "Failed to delete")}
-              >
-                Delete it
-              </button>
-            </div>
-          </div>
-        )}
       </div>
 
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} />
+
+      {confirmingDelete && pattern && (
+        <ConfirmDialog
+          title={`Delete ${tile.name}?`}
+          body="Every square it puts on the calendar goes with it. Transactions that already posted stay where they are, and so do the category and its envelope."
+          confirmLabel="Delete"
+          onCancel={() => setConfirmingDelete(false)}
+          onConfirm={async () => {
+            await api.deleteRecurringPattern(householdId, pattern.id);
+            await onSaved();
+            onClose();
+          }}
+        />
+      )}
+
+      {confirmingUnlink && (
+        <ConfirmDialog
+          title="Unlink this transaction?"
+          body={`The calendar goes back to expecting this ${noun}, and the transaction stays as an ordinary charge.`}
+          confirmLabel="Unlink"
+          danger={false}
+          onCancel={() => setConfirmingUnlink(false)}
+          onConfirm={async () => {
+            await api.unlinkOccurrence(householdId, occurrence.id);
+            await onSaved();
+            onClose();
+          }}
+        />
+      )}
     </Modal>
   );
 }
@@ -615,20 +774,43 @@ export function BillsIncomePage({
   const today = useMemo(() => todayIso(), []);
   const [month, setMonth] = useState(() => today.slice(0, 7));
   const { patterns, occurrencesByMonth, loading } = recurring;
-  const [error, setError] = useState<string | null>(null);
+  const page = useAction();
   const [openTile, setOpenTile] = useState<Tile | null>(null);
-  const [editingPattern, setEditingPattern] = useState<RecurringPattern | null>(null);
+  const [editingPattern, setEditingPattern] = useState<RecurringPattern | null>(
+    null,
+  );
   const [adding, setAdding] = useState<{ date?: string } | null>(null);
-  const [openTransaction, setOpenTransaction] = useState<Transaction | null>(null);
-  const [detecting, setDetecting] = useState(false);
+  const [openTransaction, setOpenTransaction] = useState<Transaction | null>(
+    null,
+  );
   const addButtonRef = useRef<HTMLButtonElement>(null);
 
   const refresh = recurring.refresh;
 
+  /** Categories a confirmed series lives in. Their envelopes are bills,
+   * whatever group they sit in, so the everyday per-diem leaves them out —
+   * otherwise a bill is counted once on the calendar and again as daily
+   * spending. */
+  const billCategoryIds = useMemo(
+    () =>
+      new Set(
+        patterns
+          .filter((p) => p.status === "confirmed" && p.category_id)
+          .map((p) => p.category_id!),
+      ),
+    [patterns],
+  );
+
   // The projection needs every month between today and the one on screen,
   // not just the visible one: a future month's estimate that skipped the
   // bills in between would start from the wrong balance.
-  const neededMonths = useMemo(() => (month >= today.slice(0, 7) ? monthsBetween(today.slice(0, 7), month) : [month]), [month, today]);
+  const neededMonths = useMemo(
+    () =>
+      month >= today.slice(0, 7)
+        ? monthsBetween(today.slice(0, 7), month)
+        : [month],
+    [month, today],
+  );
   const ensureMonths = recurring.ensureMonths;
   useEffect(() => {
     ensureMonths(neededMonths);
@@ -650,21 +832,31 @@ export function BillsIncomePage({
     return () => window.removeEventListener("keydown", onKey);
   }, [openTile, adding, editingPattern, openTransaction]);
 
-  const patternById = useMemo(() => new Map(patterns.map((p) => [p.id, p])), [patterns]);
-  const categoryById = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
-  const billCategoryIds = useMemo(
-    () => new Set(patterns.filter((p) => p.status === "confirmed" && p.category_id).map((p) => p.category_id!)),
+  const patternById = useMemo(
+    () => new Map(patterns.map((p) => [p.id, p])),
     [patterns],
   );
-  const transactionById = useMemo(() => new Map(transactions.map((t) => [t.id, t])), [transactions]);
+  const categoryById = useMemo(
+    () => new Map(categories.map((c) => [c.id, c])),
+    [categories],
+  );
+  const transactionById = useMemo(
+    () => new Map(transactions.map((t) => [t.id, t])),
+    [transactions],
+  );
 
-  const occurrences = useMemo(() => occurrencesByMonth[month] ?? [], [occurrencesByMonth, month]);
+  const occurrences = useMemo(
+    () => occurrencesByMonth[month] ?? [],
+    [occurrencesByMonth, month],
+  );
 
   const tilesByDate = useMemo(() => {
     const byDate = new Map<string, Tile[]>();
     for (const occurrence of occurrences) {
       const pattern = patternById.get(occurrence.pattern_id);
-      const category = pattern?.category_id ? categoryById.get(pattern.category_id) : undefined;
+      const category = pattern?.category_id
+        ? categoryById.get(pattern.category_id)
+        : undefined;
       const tile: Tile = {
         occurrence,
         pattern,
@@ -673,7 +865,8 @@ export function BillsIncomePage({
         isIncome: pattern?.kind === "income",
         amountCents: occurrenceAmountCents(occurrence, pattern),
         settled: occurrence.status === "matched",
-        overdue: occurrence.status === "upcoming" && occurrence.due_date < today,
+        overdue:
+          occurrence.status === "upcoming" && occurrence.due_date < today,
         skipped: occurrence.status === "skipped",
       };
       const bucket = byDate.get(occurrence.due_date) ?? [];
@@ -683,7 +876,11 @@ export function BillsIncomePage({
     // Income first, then the largest bills — the tiles that change the
     // day's shape the most are the ones you see without expanding.
     for (const bucket of byDate.values()) {
-      bucket.sort((a, b) => Number(b.isIncome) - Number(a.isIncome) || (b.amountCents ?? 0) - (a.amountCents ?? 0));
+      bucket.sort(
+        (a, b) =>
+          Number(b.isIncome) - Number(a.isIncome) ||
+          (b.amountCents ?? 0) - (a.amountCents ?? 0),
+      );
     }
     return byDate;
   }, [occurrences, patternById, categoryById, today]);
@@ -698,16 +895,29 @@ export function BillsIncomePage({
         startingCashCents: cashOnHandCents(accounts),
         occurrencesByMonth,
         patternById,
-        perDiemCentsForMonth: (m) => perDiemCents(envelopes, categoryById, m, billCategoryIds),
+        perDiemCentsForMonth: (m) =>
+          perDiemCents(envelopes, categoryById, m, billCategoryIds),
       }),
-    [month, today, accounts, occurrencesByMonth, patternById, envelopes, categoryById, billCategoryIds],
+    [
+      month,
+      today,
+      accounts,
+      occurrencesByMonth,
+      patternById,
+      envelopes,
+      categoryById,
+      billCategoryIds,
+    ],
   );
 
   const totals = useMemo(() => {
     let income = 0;
     let bills = 0;
     for (const occurrence of occurrences) {
-      const signed = occurrenceSignedCents(occurrence, patternById.get(occurrence.pattern_id));
+      const signed = occurrenceSignedCents(
+        occurrence,
+        patternById.get(occurrence.pattern_id),
+      );
       if (signed > 0) income += signed;
       else bills += -signed;
     }
@@ -717,7 +927,13 @@ export function BillsIncomePage({
   function weekNetCents(week: { date: string | null }[]): number {
     return week.reduce((sum, cell) => {
       if (!cell.date) return sum;
-      return sum + (tilesByDate.get(cell.date) ?? []).reduce((s, t) => s + occurrenceSignedCents(t.occurrence, t.pattern), 0);
+      return (
+        sum +
+        (tilesByDate.get(cell.date) ?? []).reduce(
+          (s, t) => s + occurrenceSignedCents(t.occurrence, t.pattern),
+          0,
+        )
+      );
     }, 0);
   }
 
@@ -725,24 +941,55 @@ export function BillsIncomePage({
     await Promise.all([refresh(), onChanged(), onTransactionsChanged()]);
   }
 
+  const detecting = page.busyKey === "detect";
+
   async function detect() {
-    setDetecting(true);
-    setError(null);
-    try {
-      const found = await api.detectRecurringPatterns(householdId);
-      // Detection only ever *suggests*; anything it turns up still needs a
-      // category before it can go on the calendar, which is what the
-      // review strip below does.
-      if (found.length === 0) setError("Nothing new — every repeating merchant in your history is already on the calendar.");
-      await refresh();
-    } catch (err) {
-      setError(describeRecurringPatternError(err, "Couldn't look for recurring bills"));
-    } finally {
-      setDetecting(false);
+    let found = 0;
+    const ok = await page.run(
+      async () => {
+        try {
+          found = (await api.detectRecurringPatterns(householdId)).length;
+        } catch (err) {
+          throw new Error(
+            describeRecurringPatternError(
+              err,
+              "Couldn't look for repeating charges.",
+            ),
+          );
+        }
+        await refresh();
+      },
+      { key: "detect" },
+    );
+    // Detection only ever *suggests*; anything it turns up still needs a
+    // category before it can go on the calendar, which is what the
+    // review strip below does.
+    if (ok) {
+      if (found === 0)
+        page.showInfo(
+          "Nothing new. Every repeating merchant in your history is already on the calendar.",
+        );
+      else
+        page.showSuccess(
+          `Found ${found} that repeat${found === 1 ? "s" : ""}. Review ${found === 1 ? "it" : "them"} below.`,
+        );
     }
   }
 
-  const suggested = useMemo(() => patterns.filter((p) => p.status === "suggested"), [patterns]);
+  function dismissSuggestion(p: RecurringPattern) {
+    void page.run(
+      async () => {
+        await api.dismissRecurringPattern(householdId, p.id);
+        await refresh();
+      },
+      { key: p.id, success: `${p.merchant_pattern} won't be suggested again.` },
+    );
+  }
+
+  const suggested = useMemo(
+    () => patterns.filter((p) => p.status === "suggested"),
+    [patterns],
+  );
   const isCurrentMonth = month === today.slice(0, 7);
   const perDiem = perDiemCents(envelopes, categoryById, month, billCategoryIds);
 
@@ -751,18 +998,28 @@ export function BillsIncomePage({
       <div className="grid-3">
         <div className="card card--emphasis card--padded stat-tile">
           <span className="label">Income this month</span>
-          <span className="figure money positive">{formatCents(totals.income)}</span>
-          <span className="detail">Every deposit the calendar expects, received or not.</span>
+          <span className="figure money positive">
+            {formatCents(totals.income)}
+          </span>
+          <span className="detail">
+            Every payment the calendar expects, received or not.
+          </span>
         </div>
         <div className="card card--emphasis card--padded stat-tile">
           <span className="label">Bills this month</span>
           <span className="figure money">{formatCents(totals.bills)}</span>
-          <span className="detail">Committed before a dollar of everyday spending.</span>
+          <span className="detail">
+            Committed before a dollar of everyday spending.
+          </span>
         </div>
         <div className="card card--padded stat-tile">
           <span className="label">Left over</span>
-          <span className={`figure money ${totals.net < 0 ? "negative" : ""}`}>{formatCents(totals.net)}</span>
-          <span className="detail">Income minus bills — what the Spending Plan has to work with.</span>
+          <span className={`figure money ${totals.net < 0 ? "negative" : ""}`}>
+            {formatCents(totals.net)}
+          </span>
+          <span className="detail">
+            Income minus bills — what the Spending Plan has to work with.
+          </span>
         </div>
       </div>
 
@@ -770,8 +1027,14 @@ export function BillsIncomePage({
         <section className="card card--padded">
           <div className="section-head">
             <div>
-              <h2>Found {suggested.length} that repeat{suggested.length === 1 ? "s" : ""}</h2>
-              <p className="hint">Add one to put it on the calendar, or dismiss it if it isn't really a bill.</p>
+              <h2>
+                Found {suggested.length} that repeat
+                {suggested.length === 1 ? "s" : ""}
+              </h2>
+              <p className="hint">
+                Add one to put it on the calendar, or dismiss it if it isn't
+                really a bill.
+              </p>
             </div>
           </div>
           <div className="row-list">
@@ -780,19 +1043,29 @@ export function BillsIncomePage({
                 <div className="row-figure" style={{ flex: "1 1 auto" }}>
                   <span className="row-title">{p.merchant_pattern}</span>
                   <span className="row-meta">
-                    {p.kind === "expense" ? "Charge" : "Deposit"} · {scheduleLabel(p)} · seen {p.sample_count} times
+                    {p.kind === "expense" ? "Bill" : "Income"} ·{" "}
+                    {scheduleLabel(p)} · seen {p.sample_count} times
                   </span>
                 </div>
-                {p.expected_amount_cents !== null && <span className="money">{formatCents(Math.abs(p.expected_amount_cents))}</span>}
-                <button type="button" onClick={() => setEditingPattern(p)}>
+                {p.expected_amount_cents !== null && (
+                  <span className="money">
+                    {formatCents(Math.abs(p.expected_amount_cents))}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  disabled={page.busyKey === p.id}
+                  onClick={() => setEditingPattern(p)}
+                >
                   Add to calendar
                 </button>
                 <button
                   type="button"
                   className="secondary"
-                  onClick={() => void api.dismissRecurringPattern(householdId, p.id).then(refresh)}
+                  disabled={page.busyKey === p.id}
+                  onClick={() => dismissSuggestion(p)}
                 >
-                  Not a bill
+                  {page.busyKey === p.id ? "Working…" : "Not a bill"}
                 </button>
               </div>
             ))}
@@ -803,38 +1076,78 @@ export function BillsIncomePage({
       <section className="card calendar-card">
         <header className="calendar-head">
           <div className="calendar-nav">
-            <button type="button" className="row-edit-btn" aria-label="Previous month" onClick={() => setMonth(addMonths(month, -1))}>
+            <button
+              type="button"
+              className="row-edit-btn"
+              aria-label="Previous month"
+              onClick={() => setMonth(addMonths(month, -1))}
+            >
               ‹
             </button>
             <h2 className="calendar-month" aria-live="polite">
               {monthLabel(month)}
             </h2>
-            <button type="button" className="row-edit-btn" aria-label="Next month" onClick={() => setMonth(addMonths(month, 1))}>
+            <button
+              type="button"
+              className="row-edit-btn"
+              aria-label="Next month"
+              onClick={() => setMonth(addMonths(month, 1))}
+            >
               ›
             </button>
             {!isCurrentMonth && (
-              <button type="button" className="secondary" onClick={() => setMonth(today.slice(0, 7))}>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setMonth(today.slice(0, 7))}
+              >
                 Today
               </button>
             )}
           </div>
           <div className="row" style={{ gap: 8 }}>
-            <button type="button" className="secondary" onClick={detect} disabled={detecting}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={detect}
+              disabled={detecting}
+            >
               {detecting ? "Looking…" : "Find repeating charges"}
             </button>
-            <button type="button" ref={addButtonRef} onClick={() => setAdding({})}>
-              + Add
+            <button
+              type="button"
+              ref={addButtonRef}
+              onClick={() => setAdding({})}
+            >
+              Add bill or income
             </button>
           </div>
         </header>
 
-        {(error ?? recurring.error) && (
-          <p className="error" style={{ padding: "0 24px 12px" }}>
-            {error ?? recurring.error}
-          </p>
-        )}
+        <div style={{ padding: "0 24px" }}>
+          <Notice
+            notice={page.notice}
+            onDismiss={page.clear}
+            style={{ marginBottom: 12 }}
+          />
+          {recurring.error && (
+            <Notice
+              notice={{ kind: "error", text: recurring.error }}
+              style={{ marginBottom: 12 }}
+            />
+          )}
+          {loading && (
+            <p className="hint" style={{ margin: "0 0 12px" }}>
+              Loading…
+            </p>
+          )}
+        </div>
 
-        <div className="calendar-grid" role="grid" aria-label={`Bills and income for ${monthLabel(month)}`}>
+        <div
+          className="calendar-grid"
+          role="grid"
+          aria-label={`Bills and income for ${monthLabel(month)}`}
+        >
           <div className="calendar-weekdays" role="row">
             {WEEKDAY_ABBR.map((d) => (
               <div key={d} className="calendar-weekday" role="columnheader">
@@ -844,7 +1157,10 @@ export function BillsIncomePage({
                 </span>
               </div>
             ))}
-            <div className="calendar-weekday calendar-weekday--net" role="columnheader">
+            <div
+              className="calendar-weekday calendar-weekday--net"
+              role="columnheader"
+            >
               Net
             </div>
           </div>
@@ -854,7 +1170,15 @@ export function BillsIncomePage({
             return (
               <div className="calendar-week" role="row" key={weekIndex}>
                 {week.map((cell, cellIndex) => {
-                  if (!cell.date) return <div className="calendar-day calendar-day--blank" key={cellIndex} role="gridcell" aria-hidden />;
+                  if (!cell.date)
+                    return (
+                      <div
+                        className="calendar-day calendar-day--blank"
+                        key={cellIndex}
+                        role="gridcell"
+                        aria-hidden
+                      />
+                    );
                   // Bound to a const so the click handlers below keep the
                   // narrowing the guard above just established.
                   const date = cell.date;
@@ -862,7 +1186,11 @@ export function BillsIncomePage({
                   const balance = balances.get(date);
                   const isToday = date === today;
                   return (
-                    <div className={`calendar-day ${isToday ? "is-today" : ""} ${date < today ? "is-past" : ""}`} role="gridcell" key={date}>
+                    <div
+                      className={`calendar-day ${isToday ? "is-today" : ""} ${date < today ? "is-past" : ""}`}
+                      role="gridcell"
+                      key={date}
+                    >
                       {/* The whole empty area of the square is the "add
                           here" target, but it sits behind the tiles rather
                           than wrapping them — a button inside a button is
@@ -887,7 +1215,9 @@ export function BillsIncomePage({
                             key={tile.occurrence.id}
                             className={[
                               "cal-tile",
-                              tile.isIncome ? "cal-tile--income" : "cal-tile--bill",
+                              tile.isIncome
+                                ? "cal-tile--income"
+                                : "cal-tile--bill",
                               tile.settled ? "is-settled" : "",
                               tile.overdue ? "is-overdue" : "",
                               tile.skipped ? "is-skipped" : "",
@@ -896,7 +1226,9 @@ export function BillsIncomePage({
                             onClick={() => setOpenTile(tile)}
                           >
                             <span className="cal-tile-amount">
-                              {tile.amountCents === null ? "—" : formatCents(tile.amountCents)}
+                              {tile.amountCents === null
+                                ? "—"
+                                : formatCents(tile.amountCents)}
                               {tile.settled && (
                                 <span className="cal-tile-check" aria-hidden>
                                   ✓
@@ -908,16 +1240,26 @@ export function BillsIncomePage({
                         ))}
                       </div>
                       {balance !== undefined && (
-                        <span className={`calendar-day-balance ${balance < 0 ? "is-negative" : ""}`} title="Estimated cash on hand, projected from today">
+                        <span
+                          className={`calendar-day-balance ${balance < 0 ? "is-negative" : ""}`}
+                          title="Estimated cash on hand, projected from today"
+                        >
                           {formatCents(balance)}
                         </span>
                       )}
                     </div>
                   );
                 })}
-                <div className={`calendar-week-net ${net < 0 ? "is-negative" : net > 0 ? "is-positive" : ""}`} role="gridcell">
+                <div
+                  className={`calendar-week-net ${net < 0 ? "is-negative" : net > 0 ? "is-positive" : ""}`}
+                  role="gridcell"
+                >
                   <span className="calendar-week-net-label">Week</span>
-                  <span className="money">{net === 0 ? "—" : `${net > 0 ? "+" : ""}${formatCents(net)}`}</span>
+                  <span className="money">
+                    {net === 0
+                      ? "—"
+                      : `${net > 0 ? "+" : ""}${formatCents(net)}`}
+                  </span>
                 </div>
               </div>
             );
@@ -926,34 +1268,54 @@ export function BillsIncomePage({
 
         <footer className="calendar-legend">
           <span className="legend-item">
-            <span className="legend-swatch legend-swatch--income" aria-hidden /> Income
+            <span className="legend-swatch legend-swatch--income" aria-hidden />{" "}
+            Income
           </span>
           <span className="legend-item">
-            <span className="legend-swatch legend-swatch--bill" aria-hidden /> Bill
+            <span className="legend-swatch legend-swatch--bill" aria-hidden />{" "}
+            Bill
           </span>
           <span className="legend-item">
-            <span className="legend-swatch legend-swatch--settled" aria-hidden /> ✓ posted
+            <span
+              className="legend-swatch legend-swatch--settled"
+              aria-hidden
+            />{" "}
+            ✓ posted
           </span>
           <span className="legend-item">
-            <span className="legend-swatch legend-swatch--overdue" aria-hidden /> Overdue
+            <span
+              className="legend-swatch legend-swatch--overdue"
+              aria-hidden
+            />{" "}
+            Overdue
           </span>
           <span className="legend-item legend-item--balance">
-            Grey figure: estimated cash that day — today's balance, less {formatCents(perDiem)}/day of everyday spending, plus income, minus
+            Grey figure: estimated cash that day — today's balance, less{" "}
+            {formatCents(perDiem)}/day of everyday spending, plus income, minus
             bills. A guess, not a forecast.
           </span>
         </footer>
       </section>
 
-      {loading && <p className="hint">Loading…</p>}
       {!loading && !recurring.error && occurrences.length === 0 && (
         <div className="empty-state">
-          <p className="empty-state-title">Nothing on the calendar for {monthLabel(month)}</p>
-          <p className="hint">Add a bill or a paycheck, or let it look through your transactions for things that already repeat.</p>
+          <p className="empty-state-title">
+            Nothing on the calendar for {monthLabel(month)}
+          </p>
+          <p className="hint">
+            Add a bill or a paycheck, or let it look through your transactions
+            for things that already repeat.
+          </p>
           <div className="row" style={{ gap: 8, justifyContent: "center" }}>
             <button type="button" onClick={() => setAdding({})}>
               Add a bill or income
             </button>
-            <button type="button" className="secondary" onClick={detect} disabled={detecting}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={detect}
+              disabled={detecting}
+            >
               {detecting ? "Looking…" : "Find repeating charges"}
             </button>
           </div>
@@ -965,7 +1327,11 @@ export function BillsIncomePage({
           householdId={householdId}
           tile={openTile}
           today={today}
-          matchedTransaction={openTile.occurrence.matched_transaction_id ? transactionById.get(openTile.occurrence.matched_transaction_id) : undefined}
+          matchedTransaction={
+            openTile.occurrence.matched_transaction_id
+              ? transactionById.get(openTile.occurrence.matched_transaction_id)
+              : undefined
+          }
           onClose={() => setOpenTile(null)}
           onSaved={refreshEverything}
           onEditSeries={() => {

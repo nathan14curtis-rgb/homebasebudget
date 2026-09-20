@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   api,
+  errorMessage,
   type Account,
   type Asset,
   type AssetType,
@@ -25,6 +26,7 @@ import { DocumentsPage } from "./components/DocumentsPage";
 import { MaintenancePage } from "./components/MaintenancePage";
 import { AssetsPage } from "./components/AssetsPage";
 import { SettingsPage } from "./components/SettingsPage";
+import { Notice, useAction } from "./components/Notice";
 import { getPageHead } from "./pageHeads";
 import { PageActionContext, type PageAction } from "./pageAction";
 import { useRecurring } from "./useRecurring";
@@ -45,7 +47,12 @@ export function App() {
   const [household, setHousehold] = useState<Household | null>(null);
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const createAction = useAction();
+  // The first thing that went wrong loading the household's data, shown
+  // once at the top of the page. A list that failed to load used to be an
+  // unhandled rejection and a blank section, indistinguishable from an
+  // empty one.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [newHouseholdName, setNewHouseholdName] = useState("");
   const [newCreatorName, setNewCreatorName] = useState("");
   const [showCreateHousehold, setShowCreateHousehold] = useState(false);
@@ -136,13 +143,19 @@ export function App() {
   }, [household]);
 
   useEffect(() => {
-    refreshUsers();
-    refreshAccounts();
-    refreshCategories();
-    refreshEnvelopes();
-    refreshTransactions();
-    refreshAssets();
-    refreshEnvelopeSummaries();
+    setLoadError(null);
+    const loads: Array<[string, () => Promise<void>]> = [
+      ["members", refreshUsers],
+      ["accounts", refreshAccounts],
+      ["categories", refreshCategories],
+      ["envelopes", refreshEnvelopes],
+      ["transactions", refreshTransactions],
+      ["assets", refreshAssets],
+      ["this month's envelope balances", refreshEnvelopeSummaries],
+    ];
+    for (const [what, load] of loads) {
+      load().catch((err) => setLoadError((prev) => prev ?? `Couldn't load ${what}. ${errorMessage(err)}`));
+    }
   }, [refreshUsers, refreshAccounts, refreshCategories, refreshEnvelopes, refreshTransactions, refreshAssets, refreshEnvelopeSummaries]);
 
   // Adding a category creates its envelope in the same request (see
@@ -154,24 +167,13 @@ export function App() {
 
   async function createHousehold(e: FormEvent) {
     e.preventDefault();
-    setError(null);
-    try {
+    if (!newHouseholdName.trim()) return createAction.showError("Give your household a name.");
+    if (!newCreatorName.trim()) return createAction.showError("Enter your name.");
+    await createAction.run(async () => {
       const { household: hh, userId } = await api.createHousehold(newHouseholdName.trim(), newCreatorName.trim());
       setCurrentUserId(userId);
       setHousehold(hh);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create household");
-    }
-  }
-
-  /** The header action for a page that has an add form but no registered
-   * action of its own: scroll the form into view and put the cursor in its
-   * first field, which is what clicking "Add task" should do. */
-  function focusPageAddForm() {
-    const form = document.getElementById("page-add-form");
-    if (!form) return;
-    form.scrollIntoView({ behavior: "smooth", block: "center" });
-    form.querySelector<HTMLElement>("input, select, textarea")?.focus({ preventScroll: true });
+    });
   }
 
   async function logout() {
@@ -281,13 +283,15 @@ export function App() {
               required
             />
           </div>
-          <button type="submit">Create</button>
-          {error && <p className="error">{error}</p>}
+          <button type="submit" disabled={createAction.busy}>
+            {createAction.busy ? "Creating…" : "Create household"}
+          </button>
+          <Notice notice={createAction.notice} onDismiss={createAction.clear} style={{ marginTop: 12 }} />
           <p className="hint">
             Already have a household?{" "}
-            <a href="#" onClick={(e) => (e.preventDefault(), setShowCreateHousehold(false))}>
+            <button type="button" className="link-button" onClick={() => setShowCreateHousehold(false)}>
               Log in instead
-            </a>
+            </button>
             .
           </p>
         </form>
@@ -323,18 +327,20 @@ export function App() {
               <h1 className="page-title">{head.title}</h1>
               <p className="page-sub">{head.subtitle}</p>
             </div>
-            {/* One action, and only where the page actually has one. A page
-                with an add form but no registered action gets a button that
-                jumps to and focuses that form — a real action too, just a
-                cheaper one to wire. */}
-            {(pageAction || head.primaryCta) && (
+            {/* One action, and only where the page registered one. It
+                always opens that page's own dialog. */}
+            {pageAction && (
               <div className="page-actions">
-                <button type="button" onClick={pageAction ? pageAction.run : focusPageAddForm}>
-                  {pageAction?.label ?? head.primaryCta}
+                <button type="button" onClick={pageAction.run}>
+                  {pageAction.label}
                 </button>
               </div>
             )}
           </header>
+
+          {loadError && (
+            <Notice notice={{ kind: "error", text: loadError }} onDismiss={() => setLoadError(null)} style={{ marginBottom: 16 }} />
+          )}
 
           {activeView === "Overview" && (
             <OverviewPage
@@ -414,7 +420,9 @@ export function App() {
             <MembersPage householdId={household.id} users={users} accounts={accounts} transactions={transactions} onChanged={refreshUsers} />
           )}
           {documentCategory && <DocumentsPage householdId={household.id} category={documentCategory} users={users} assets={assets} />}
-          {maintenanceAssetType && <MaintenancePage householdId={household.id} assetType={maintenanceAssetType} assets={assets} />}
+          {maintenanceAssetType && (
+            <MaintenancePage householdId={household.id} assetType={maintenanceAssetType} assets={assets} onGoToAssets={() => changeView(ASSET_SUMMARY_VIEW)} />
+          )}
           {(activeView === ASSET_SUMMARY_VIEW || assetIdInView) && (
             <AssetsPage householdId={household.id} assets={assets} selectedAssetId={assetIdInView ?? undefined} onChanged={refreshAssets} />
           )}

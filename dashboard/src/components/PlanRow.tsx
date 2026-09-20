@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Category, RecurringPattern, SeriesOccurrence, Transaction } from "../api";
 import { formatCents } from "../format";
+import { NEEDS_CATEGORY } from "../copy";
 
 /**
  * A row on the Spending Plan (docs/SPENDING_PLAN_EDITING.md phase 5).
@@ -169,8 +170,8 @@ export function PlanRow({
 
   return (
     <div
-      className={`row-item ${excluded ? "row-item--excluded" : ""}`}
-      style={{ cursor: "pointer", flexWrap: "wrap", rowGap: 8 }}
+      className={`row-item row-item--clickable ${excluded ? "row-item--excluded" : ""}`}
+      style={{ flexWrap: "wrap", rowGap: 8 }}
       onClick={(e) => {
         if ((e.target as HTMLElement).closest("button, input, select")) return;
         onOpen();
@@ -178,7 +179,7 @@ export function PlanRow({
     >
       <div className="row-figure" style={{ flex: "1 1 200px", minWidth: 160 }}>
         <span className="row-title">{planItemTitle(item, category)}</span>
-        <span className="row-meta">{category?.name ?? "Uncategorized"}</span>
+        <span className="row-meta">{category?.name ?? NEEDS_CATEGORY}</span>
       </div>
 
       <DateChip date={planItemDate(item)} />
