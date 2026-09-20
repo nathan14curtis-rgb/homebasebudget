@@ -786,29 +786,6 @@ button.danger:hover {
   border-bottom: none;
 }
 
-.pill {
-  display: inline-block;
-  font-size: 0.75rem;
-  padding: 0.15rem 0.55rem;
-  border-radius: var(--radius-pill);
-  background: var(--surface-emphasis);
-  border: 1px solid var(--border);
-  color: var(--muted);
-}
-.pill.ok {
-  color: var(--teal);
-  border-color: var(--teal);
-}
-.pill.warn {
-  color: var(--red);
-  border-color: var(--red);
-}
-
-.error {
-  color: var(--red);
-  font-size: 0.9rem;
-}
-
 .hint {
   color: var(--muted);
   font-size: 0.85rem;
@@ -1879,4 +1856,72 @@ button.danger:disabled:hover {
 .grid-3--compact {
   grid-template-columns: repeat(auto-fit, minmax(min(110px, 100%), 1fr));
   gap: 16px;
+}
+
+/* ---------- Notices: how an action reports back (components/Notice.tsx) ---------- */
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-control);
+  font-size: 14px;
+  line-height: 1.45;
+  border: 1px solid var(--border);
+  background: var(--surface-emphasis);
+  color: var(--body-text);
+}
+.notice--error {
+  background: #fbeceb;
+  border-color: var(--red);
+  color: var(--red);
+}
+.notice--success {
+  background: #e8f4f1;
+  border-color: var(--teal);
+  color: var(--ink);
+}
+.notice--info {
+  background: var(--surface-emphasis);
+  color: var(--body-text);
+}
+.notice-text {
+  flex: 1 1 auto;
+}
+.notice-dismiss {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.notice-dismiss:hover {
+  opacity: 1;
+  background: none;
+}
+
+/* A row that opens something when clicked, so the cursor says so. */
+.row-item--clickable {
+  cursor: pointer;
+}
+.row-item--empty:hover {
+  background: inherit;
+}
+
+/* Label above a field inside a plain form row (the add forms used to rely
+   on placeholders alone). */
+.field-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+}
+.field-inline > label {
+  font-size: 12px;
+  color: var(--muted);
 }

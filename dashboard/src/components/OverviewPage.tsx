@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, type Category, type Envelope, type EnvelopeMonthSummary, type Transaction } from "../api";
+import { api, errorMessage, type Category, type Envelope, type EnvelopeMonthSummary, type Transaction } from "../api";
+import { Notice } from "./Notice";
+import { needsCategoryCount } from "../copy";
 import { formatCents, currentMonth } from "../format";
 import { occurrenceAmountCents, todayIso } from "../calendar";
 import type { Recurring } from "../useRecurring";
@@ -39,15 +41,21 @@ export function OverviewPage({
   onGoToBillsIncome,
 }: Props) {
   const [monthTransactions, setMonthTransactions] = useState<Transaction[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const categoryById = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
   const activeEnvelopes = useMemo(() => envelopes.filter((e) => !e.archived_at), [envelopes]);
 
   useEffect(() => {
     let cancelled = false;
     const { fromDate, toDate } = monthRange();
-    api.listTransactions(householdId, { fromDate, toDate, limit: 1000 }).then((rows) => {
-      if (!cancelled) setMonthTransactions(rows);
-    });
+    api
+      .listTransactions(householdId, { fromDate, toDate, limit: 1000 })
+      .then((rows) => {
+        if (!cancelled) setMonthTransactions(rows);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(errorMessage(err, "Couldn't load this month's transactions."));
+      });
     return () => {
       cancelled = true;
     };
@@ -203,8 +211,11 @@ export function OverviewPage({
     [activeEnvelopes, categoryById],
   );
 
+  const needsCategory = transactions.filter((t) => !t.category_id && !t.is_transfer).length;
+
   return (
     <>
+      {loadError && <Notice notice={{ kind: "error", text: loadError }} style={{ marginBottom: 16 }} />}
       <section className="grid-2" style={{ gridTemplateColumns: "1.15fr 1fr", alignItems: "stretch" }}>
         <div className="card card--emphasis card--padded" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
           <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
@@ -251,9 +262,9 @@ export function OverviewPage({
       <section className="section" style={{ gap: 16 }}>
         <div className="section-header">
           <h2 className="section-title">Bills &amp; income</h2>
-          <a href="#" onClick={(e) => (e.preventDefault(), onGoToBillsIncome())}>
+          <button type="button" className="link-button" onClick={onGoToBillsIncome}>
             Open the calendar
-          </a>
+          </button>
         </div>
         <div className="grid-2" style={{ alignItems: "stretch" }}>
           <div className="card card--padded" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -302,9 +313,9 @@ export function OverviewPage({
       <section className="section">
         <div className="section-header">
           <h2 className="section-title">Everyday envelopes</h2>
-          <a href="#" onClick={(e) => (e.preventDefault(), onGoToEnvelopes())}>
-            Adjust allocations
-          </a>
+          <button type="button" className="link-button" onClick={onGoToEnvelopes}>
+            Open the Spending Plan
+          </button>
         </div>
         <div className="grid-4" style={{ alignItems: "stretch" }}>
           {envelopeCards.map((e) => {
@@ -386,9 +397,9 @@ export function OverviewPage({
               </div>
             )}
           </div>
-          {transactions.some((t) => !t.category_id && !t.is_transfer) && (
-            <button className="secondary" onClick={onGoToTransactions}>
-              Review uncategorized transactions
+          {needsCategory > 0 && (
+            <button type="button" className="link-button" style={{ alignSelf: "flex-start" }} onClick={onGoToTransactions}>
+              {needsCategoryCount(needsCategory)}. Review them
             </button>
           )}
         </div>
@@ -412,7 +423,7 @@ export function OverviewPage({
                   <div className="progress-track">
                     <div className="progress-fill" style={{ width: `${barPct}%` }} />
                   </div>
-                  <span className="row-meta">Target date {g.target_date}</span>
+                  <span className="row-meta">Reach it by {g.target_date}</span>
                 </div>
               );
             })}

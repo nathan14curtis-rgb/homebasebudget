@@ -1,6 +1,10 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, type Account, type User } from "../api";
+import { VALIDATION } from "../copy";
 import { Modal } from "./ScheduleFields";
+import { Notice, useAction } from "./Notice";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { EmptyRow } from "./EmptyState";
 
 declare global {
   interface Window {
@@ -24,14 +28,14 @@ function loadPlaidScript(): Promise<void> {
     const existing = document.querySelector<HTMLScriptElement>(`script[src="${PLAID_LINK_SCRIPT_SRC}"]`);
     if (existing) {
       existing.addEventListener("load", () => resolve());
-      existing.addEventListener("error", () => reject(new Error("Failed to load Plaid Link")));
+      existing.addEventListener("error", () => reject(new Error("Couldn't load the bank-linking window. Check your connection and try again.")));
       return;
     }
     const script = document.createElement("script");
     script.src = PLAID_LINK_SCRIPT_SRC;
     script.async = true;
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Failed to load Plaid Link"));
+    script.onerror = () => reject(new Error("Couldn't load the bank-linking window. Check your connection and try again."));
     document.head.appendChild(script);
   });
 }
@@ -43,9 +47,9 @@ function statusLabel(account: Account): { text: string; className: string } {
   // account that has one — a hand-added, CSV-only account is active too,
   // and calling it connected was the kind of small lie that makes people
   // stop trusting the rest of the page.
-  if (status === "active") return { text: isLinked ? "connected" : "manual", className: isLinked ? "pill ok" : "pill" };
-  if (status === "login_required") return { text: "needs re-link", className: "pill warn" };
-  return { text: status, className: "pill" };
+  if (status === "active") return isLinked ? { text: "Connected", className: "badge badge--soft badge--positive" } : { text: "Manual", className: "badge badge--soft badge--muted" };
+  if (status === "login_required") return { text: "Needs re-link", className: "badge badge--soft badge--warn" };
+  return { text: status, className: "badge badge--soft badge--muted" };
 }
 
 const ACCOUNT_TYPE_LABELS: Record<Account["type"], string> = {
@@ -73,15 +77,15 @@ interface Props {
 export function AccountsSection({ householdId, users, accounts, onChanged, onTransactionsChanged }: Props) {
   const [linkingAsUserId, setLinkingAsUserId] = useState("");
   const [linking, setLinking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [manualName, setManualName] = useState("");
   const [manualType, setManualType] = useState<Account["type"]>("depository_checking");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const [editOwnerId, setEditOwnerId] = useState("");
-  const [unlinkingId, setUnlinkingId] = useState<string | null>(null);
   const [confirmingUnlink, setConfirmingUnlink] = useState<Account | null>(null);
+  const [confirmingRemove, setConfirmingRemove] = useState<Account | null>(null);
   const [alsoDeleteTransactions, setAlsoDeleteTransactions] = useState(false);
+  const action = useAction();
 
   function startEdit(a: Account) {
     setEditingId(a.id);
@@ -90,24 +94,16 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
   }
 
   async function saveEdit(accountId: string) {
-    setError(null);
-    try {
-      await api.updateAccount(householdId, accountId, { name: editName.trim(), ownerUserId: editOwnerId || null });
-      setEditingId(null);
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update account");
-    }
-  }
-
-  async function remove(accountId: string) {
-    setError(null);
-    try {
-      await api.updateAccount(householdId, accountId, { status: "removed" });
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to remove account");
-    }
+    const trimmed = editName.trim();
+    if (!trimmed) return action.showError(VALIDATION.name);
+    const ok = await action.run(
+      async () => {
+        await api.updateAccount(householdId, accountId, { name: trimmed, ownerUserId: editOwnerId || null });
+        await onChanged();
+      },
+      { key: accountId },
+    );
+    if (ok) setEditingId(null);
   }
 
   /** Unlinking used to be two chained window.confirm()s, the second of
@@ -117,17 +113,14 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
    * opt-in checkbox, is both clearer and harder to do by accident. */
   async function unlink(a: Account, deleteTransactions: boolean) {
     setConfirmingUnlink(null);
-    setUnlinkingId(a.id);
-    setError(null);
-    try {
-      const result = await api.unlinkAccount(householdId, a.id, deleteTransactions);
-      await onChanged();
-      if (result.transactionsDeleted > 0) await onTransactionsChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to unlink account");
-    } finally {
-      setUnlinkingId(null);
-    }
+    await action.run(
+      async () => {
+        const result = await api.unlinkAccount(householdId, a.id, deleteTransactions);
+        await onChanged();
+        if (result.transactionsDeleted > 0) await onTransactionsChanged();
+      },
+      { key: a.id, success: deleteTransactions ? `${a.name} unlinked and its history deleted.` : `${a.name} unlinked. Its history is kept.` },
+    );
   }
 
   useEffect(() => {
@@ -136,7 +129,7 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
 
   async function link() {
     if (!linkingAsUserId) return;
-    setError(null);
+    action.clear();
     setLinking(true);
     try {
       await loadPlaidScript();
@@ -146,17 +139,18 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
           token: link_token,
           onSuccess: (publicToken, metadata) => {
             void (async () => {
-              try {
-                await api.exchangePlaidToken(householdId, publicToken, metadata.institution?.name ?? undefined);
-                for (let i = 0; i < 6; i++) {
-                  await new Promise((resolve) => setTimeout(resolve, 2000));
-                  await onChanged();
-                }
-              } catch (err) {
-                setError(err instanceof Error ? err.message : "Failed to finish linking");
-              } finally {
-                setLinking(false);
-              }
+              const bank = metadata.institution?.name;
+              await action.run(
+                async () => {
+                  await api.exchangePlaidToken(householdId, publicToken, bank ?? undefined);
+                  for (let i = 0; i < 6; i++) {
+                    await new Promise((resolve) => setTimeout(resolve, 2000));
+                    await onChanged();
+                  }
+                },
+                { key: "link", success: `${bank ?? "Your bank"} is linked. Transactions will start syncing within the hour.` },
+              );
+              setLinking(false);
             })();
           },
           onExit: () => setLinking(false),
@@ -164,41 +158,45 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
         .open();
     } catch (err) {
       setLinking(false);
-      setError(err instanceof Error ? err.message : "Failed to start Plaid Link");
+      action.showError(err instanceof Error ? err.message : "Couldn't start linking a bank.");
     }
   }
 
   async function addManualAccount(e: FormEvent) {
     e.preventDefault();
-    setError(null);
-    try {
-      await api.createAccount(householdId, {
-        name: manualName.trim(),
-        type: manualType,
-        ownerUserId: linkingAsUserId || undefined,
-      });
-      setManualName("");
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to add account");
-    }
+    const trimmed = manualName.trim();
+    if (!trimmed) return action.showError(VALIDATION.name);
+    const ok = await action.run(
+      async () => {
+        await api.createAccount(householdId, { name: trimmed, type: manualType, ownerUserId: linkingAsUserId || undefined });
+        await onChanged();
+      },
+      { key: "manual", success: `${trimmed} added.` },
+    );
+    if (ok) setManualName("");
   }
+
+  const visibleAccounts = accounts.filter((a) => a.status !== "removed");
 
   return (
     <section className="card">
       <h2>Bank accounts</h2>
       <ul className="list">
-        {accounts
-          .filter((a) => a.status !== "removed")
-          .map((a) => {
-            const status = statusLabel(a);
-            const owner = users.find((u) => u.id === a.owner_user_id);
-            if (editingId === a.id) {
-              return (
-                <li key={a.id} style={{ flexWrap: "wrap", gap: "0.5rem" }}>
-                  <span className="row" style={{ flex: 1 }}>
-                    <input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} style={{ width: 160 }} />
-                    <select value={editOwnerId} onChange={(e) => setEditOwnerId(e.target.value)}>
+        {visibleAccounts.map((a) => {
+          const status = statusLabel(a);
+          const owner = users.find((u) => u.id === a.owner_user_id);
+          const busy = action.busyKey === a.id;
+          if (editingId === a.id) {
+            return (
+              <li key={a.id} style={{ flexWrap: "wrap", gap: "0.5rem" }}>
+                <span className="row" style={{ flex: 1, alignItems: "flex-end" }}>
+                  <div className="field-inline">
+                    <label htmlFor={`account-name-${a.id}`}>Name</label>
+                    <input id={`account-name-${a.id}`} type="text" value={editName} disabled={busy} onChange={(e) => setEditName(e.target.value)} style={{ width: 160 }} />
+                  </div>
+                  <div className="field-inline">
+                    <label htmlFor={`account-owner-${a.id}`}>Whose</label>
+                    <select id={`account-owner-${a.id}`} value={editOwnerId} disabled={busy} onChange={(e) => setEditOwnerId(e.target.value)}>
                       <option value="">Joint / no owner</option>
                       {users.map((u) => (
                         <option key={u.id} value={u.id}>
@@ -206,95 +204,100 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
                         </option>
                       ))}
                     </select>
-                  </span>
-                  <span className="row">
-                    <button className="secondary" onClick={() => saveEdit(a.id)}>
-                      Save
-                    </button>
-                    <button className="secondary" onClick={() => setEditingId(null)}>
-                      Cancel
-                    </button>
-                  </span>
-                </li>
-              );
-            }
-            return (
-              <li key={a.id}>
-                <span>
-                  {a.name}
-                  {a.mask ? ` ····${a.mask}` : ""}
-                  {owner && <span className="hint"> — {owner.name}</span>}
+                  </div>
                 </span>
                 <span className="row">
-                  <span className={status.className}>{status.text}</span>
-                  <button className="secondary" onClick={() => startEdit(a)}>
-                    Edit
+                  <button type="button" onClick={() => saveEdit(a.id)} disabled={busy}>
+                    {busy ? "Saving…" : "Save"}
                   </button>
-                  {a.plaid_item_id ? (
-                    <button
-                      className="danger"
-                      onClick={() => {
-                        setAlsoDeleteTransactions(false);
-                        setConfirmingUnlink(a);
-                      }}
-                      disabled={unlinkingId === a.id}
-                    >
-                      {unlinkingId === a.id ? "Unlinking…" : "Unlink"}
-                    </button>
-                  ) : (
-                    <button className="danger" onClick={() => remove(a.id)}>
-                      Remove
-                    </button>
-                  )}
+                  <button className="secondary" type="button" onClick={() => setEditingId(null)} disabled={busy}>
+                    Cancel
+                  </button>
                 </span>
               </li>
             );
-          })}
-        {accounts.filter((a) => a.status !== "removed").length === 0 && (
+          }
+          return (
+            <li key={a.id}>
+              <span>
+                {a.name}
+                {a.mask ? ` ····${a.mask}` : ""}
+                {owner && <span className="hint"> — {owner.name}</span>}
+              </span>
+              <span className="row">
+                <span className={status.className}>{status.text}</span>
+                <button className="secondary" type="button" onClick={() => startEdit(a)} disabled={busy}>
+                  Edit
+                </button>
+                {a.plaid_item_id ? (
+                  <button
+                    className="danger"
+                    type="button"
+                    onClick={() => {
+                      setAlsoDeleteTransactions(false);
+                      setConfirmingUnlink(a);
+                    }}
+                    disabled={busy}
+                  >
+                    {busy ? "Unlinking…" : "Unlink"}
+                  </button>
+                ) : (
+                  <button className="danger" type="button" onClick={() => setConfirmingRemove(a)} disabled={busy}>
+                    {busy ? "Removing…" : "Remove"}
+                  </button>
+                )}
+              </span>
+            </li>
+          );
+        })}
+        {visibleAccounts.length === 0 && (
           <li>
-            <span className="hint">No accounts yet.</span>
+            <EmptyRow text="No accounts yet. Link a bank below, or add one by hand for CSV history." />
           </li>
         )}
       </ul>
 
-      <div className="row" style={{ marginTop: "1rem" }}>
-        <select value={linkingAsUserId} onChange={(e) => setLinkingAsUserId(e.target.value)}>
-          {users.map((u) => (
-            <option key={u.id} value={u.id}>
-              {u.name}
-            </option>
-          ))}
-        </select>
-        <button onClick={link} disabled={linking || users.length === 0}>
+      <div className="row" style={{ marginTop: "1rem", alignItems: "flex-end" }}>
+        <div className="field-inline">
+          <label htmlFor="link-as-user">Link as</label>
+          <select id="link-as-user" value={linkingAsUserId} onChange={(e) => setLinkingAsUserId(e.target.value)}>
+            {users.map((u) => (
+              <option key={u.id} value={u.id}>
+                {u.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button type="button" onClick={link} disabled={linking || users.length === 0}>
           {linking ? "Linking…" : "Link a bank account"}
         </button>
       </div>
       {users.length === 0 && <p className="hint">Add a person above first.</p>}
 
       <details style={{ marginTop: "1rem" }}>
-        <summary>Or add an account manually (for CSV-only history)</summary>
-        <form className="row" onSubmit={addManualAccount}>
-          <input
-            type="text"
-            placeholder="Account name"
-            value={manualName}
-            onChange={(e) => setManualName(e.target.value)}
-            required
-          />
-          <select value={manualType} onChange={(e) => setManualType(e.target.value as Account["type"])}>
-            {(Object.keys(ACCOUNT_TYPE_LABELS) as Account["type"][]).map((type) => (
-              <option key={type} value={type}>
-                {ACCOUNT_TYPE_LABELS[type]}
-              </option>
-            ))}
-          </select>
-          <button type="submit" className="secondary">
-            Add
+        <summary>Or add an account by hand (for CSV-only history)</summary>
+        <form className="row" onSubmit={addManualAccount} style={{ alignItems: "flex-end" }}>
+          <div className="field-inline">
+            <label htmlFor="manual-account-name">Account name</label>
+            <input id="manual-account-name" type="text" value={manualName} disabled={action.busy} onChange={(e) => setManualName(e.target.value)} />
+          </div>
+          <div className="field-inline">
+            <label htmlFor="manual-account-type">Type</label>
+            <select id="manual-account-type" value={manualType} disabled={action.busy} onChange={(e) => setManualType(e.target.value as Account["type"])}>
+              {(Object.keys(ACCOUNT_TYPE_LABELS) as Account["type"][]).map((type) => (
+                <option key={type} value={type}>
+                  {ACCOUNT_TYPE_LABELS[type]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button type="submit" className="secondary" disabled={action.busy}>
+            {action.busyKey === "manual" ? "Adding…" : "Add account"}
           </button>
         </form>
       </details>
 
-      {error && <p className="error">{error}</p>}
+      <Notice notice={action.notice} onDismiss={action.clear} style={{ marginTop: 12 }} />
 
       {confirmingUnlink && (
         <Modal
@@ -306,23 +309,15 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
               <button type="button" className="secondary" onClick={() => setConfirmingUnlink(null)}>
                 Cancel
               </button>
-              <button type="button" className="danger" onClick={() => void unlink(confirmingUnlink, alsoDeleteTransactions)}>
+              <button type="button" className="danger" data-autofocus="true" onClick={() => void unlink(confirmingUnlink, alsoDeleteTransactions)}>
                 {alsoDeleteTransactions ? "Unlink and delete history" : "Unlink"}
               </button>
             </>
           }
         >
-          <p style={{ margin: 0, lineHeight: 1.55 }}>
-            Syncing stops. Re-connecting it later means going through your bank's login again.
-          </p>
+          <p style={{ margin: 0, lineHeight: 1.55 }}>Syncing stops. Re-connecting it later means going through your bank's login again.</p>
           <label className="row" style={{ gap: 8, alignItems: "flex-start" }}>
-            <input
-              type="checkbox"
-              data-autofocus="true"
-              checked={alsoDeleteTransactions}
-              onChange={(e) => setAlsoDeleteTransactions(e.target.checked)}
-              style={{ marginTop: 3 }}
-            />
+            <input type="checkbox" checked={alsoDeleteTransactions} onChange={(e) => setAlsoDeleteTransactions(e.target.checked)} style={{ marginTop: 3 }} />
             <span>
               Also delete every transaction it has ever synced.
               <span className="hint" style={{ display: "block", margin: 0 }}>
@@ -331,6 +326,21 @@ export function AccountsSection({ householdId, users, accounts, onChanged, onTra
             </span>
           </label>
         </Modal>
+      )}
+
+      {confirmingRemove && (
+        <ConfirmDialog
+          title={`Remove ${confirmingRemove.name}?`}
+          body="It leaves this list and the Transactions filters. Transactions already imported for it are kept."
+          confirmLabel="Remove"
+          onCancel={() => setConfirmingRemove(null)}
+          onConfirm={async () => {
+            const account = confirmingRemove;
+            await api.updateAccount(householdId, account.id, { status: "removed" });
+            setConfirmingRemove(null);
+            await action.run(onChanged, { success: `${account.name} removed.` });
+          }}
+        />
       )}
     </section>
   );
