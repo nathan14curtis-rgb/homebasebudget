@@ -202,6 +202,10 @@ export function App() {
 
   const pageHeadCtx = useMemo(() => {
     const activeEnvelopes = envelopes.filter((e) => !e.archived_at);
+    // A category with a confirmed series is a bill however its envelope is
+    // grouped, the same test the Spending Plan and the calendar use.
+    const billCategoryIds = new Set(recurring.patterns.filter((p) => p.status === "confirmed" && p.category_id).map((p) => p.category_id!));
+    const isBill = (envelope: Envelope) => envelope.group_name.toLowerCase() === "bills" || billCategoryIds.has(envelope.category_id);
     let expenseSpent = 0;
     let expenseTarget = 0;
     let needingAttention = 0;
@@ -209,7 +213,7 @@ export function App() {
     for (const envelope of activeEnvelopes) {
       const summary = envelopeSummaries[envelope.id];
       const category = categoryById.get(envelope.category_id);
-      if (category?.kind === "expense" && envelope.monthly_target_cents && envelope.group_name.toLowerCase() !== "bills") {
+      if (category?.kind === "expense" && envelope.monthly_target_cents && !isBill(envelope)) {
         expenseSpent += summary?.spentCents ?? 0;
         expenseTarget += envelope.monthly_target_cents;
       }
@@ -219,7 +223,7 @@ export function App() {
       if (
         summary &&
         envelope.monthly_target_cents &&
-        envelope.group_name.toLowerCase() !== "bills" &&
+        !isBill(envelope) &&
         category?.kind === "expense" &&
         (summary.balanceCents < 0 || summary.spentCents >= envelope.monthly_target_cents * 0.85)
       ) {
@@ -243,7 +247,7 @@ export function App() {
       memberCount: users.length,
       assetName: asset?.name,
     };
-  }, [envelopes, envelopeSummaries, categoryById, transactions, users, activeView, assets, recurring.occurrencesByMonth]);
+  }, [envelopes, envelopeSummaries, categoryById, transactions, users, activeView, assets, recurring.occurrencesByMonth, recurring.patterns]);
 
   if (loading) return <p className="hint">Loading…</p>;
 

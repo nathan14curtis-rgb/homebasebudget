@@ -265,12 +265,16 @@ describe("updateRecurringPattern — editing a series", () => {
     const { household, created } = await seedSeries();
     await generateOccurrences(db, household.id, "2026-09");
 
-    const ended = await updateRecurringPattern(db, household.id, created.id, { endedAt: "2026-09-01" });
-    expect(ended.ended_at).toBe("2026-09-01");
-    // The occurrence generated before the end date is still there.
+    const ended = await updateRecurringPattern(db, household.id, created.id, { endedAt: "2026-09-30" });
+    expect(ended.ended_at).toBe("2026-09-30");
+    // The occurrence on or before the end date is still there.
     expect((await reconcileOccurrences(db, household.id, "2026-09")).length).toBe(1);
     // And nothing new is projected for a later month.
     expect((await generateOccurrences(db, household.id, "2026-10")).length).toBe(0);
+    // An unpaid square that was already projected past the end date goes
+    // with it — "stop after this month" means the calendar clears out.
+    await updateRecurringPattern(db, household.id, created.id, { endedAt: "2026-09-01" });
+    expect((await reconcileOccurrences(db, household.id, "2026-09")).length).toBe(0);
 
     const resumed = await updateRecurringPattern(db, household.id, created.id, { endedAt: null });
     expect(resumed.ended_at).toBeNull();
@@ -291,5 +295,68 @@ describe("updateRecurringPattern — editing a series", () => {
     const categories = await listCategories(db, household.id);
     const other = categories.find((c) => c.kind === "expense" && c.id !== created.category_id)!;
     expect((await updateRecurringPattern(db, household.id, created.id, { categoryId: other.id })).category_id).toBe(other.id);
+  });
+});
+
+describe("realignOccurrences — an edited series reaches the squares already on the calendar", () => {
+  async function seedSeries() {
+    const { household, account, utilities } = await seed();
+    const created = await createConfirmedRecurringPattern(db, household.id, {
+      categoryId: utilities.id,
+      merchantPattern: "ROCKY MTN POWER",
+      kind: "expense",
+      dayOfMonth: 5,
+      expectedAmountCents: 10_000,
+    });
+    return { household, account, utilities, created };
+  }
+
+  it("re-seeds an upcoming occurrence with the new expected amount", async () => {
+    const { household, created } = await seedSeries();
+    const [before] = await generateOccurrences(db, household.id, "2099-03");
+    expect(before!.amount_cents).toBe(10_000);
+
+    await updateRecurringPattern(db, household.id, created.id, { expectedAmountCents: 15_000 });
+    const after = await listOccurrences(db, household.id, "2099-03");
+    expect(after).toHaveLength(1);
+    expect(after[0]!.amount_cents).toBe(15_000);
+    expect(resolveOccurrenceAmountCents(after[0]!, { expected_amount_cents: 15_000 })).toBe(15_000);
+  });
+
+  it("moves the square when the day changes instead of leaving both", async () => {
+    const { household, created } = await seedSeries();
+    await generateOccurrences(db, household.id, "2099-03");
+
+    await updateRecurringPattern(db, household.id, created.id, { dayOfMonth: 20 });
+    const after = await listOccurrences(db, household.id, "2099-03");
+    expect(after.map((o) => o.due_date)).toEqual(["2099-03-20"]);
+  });
+
+  it("leaves a square the person edited by hand, a skip, and a match alone", async () => {
+    const { household, account, utilities, created } = await seedSeries();
+    const [march] = await generateOccurrences(db, household.id, "2099-03");
+    const [april] = await generateOccurrences(db, household.id, "2099-04");
+    const [may] = await generateOccurrences(db, household.id, "2099-05");
+    await updateOccurrence(db, household.id, march!.id, { amountOverrideCents: 12_345 });
+    await updateOccurrence(db, household.id, april!.id, { status: "skipped" });
+    const txn = await createTransaction(db, household.id, { accountId: account.id, postedAt: "2099-05-05", amountCents: -9_950, rawDescription: "ROCKY MTN POWER" });
+    await applyCategorization(db, household.id, txn.id, { categoryId: utilities.id, method: "human" });
+    expect((await listOccurrences(db, household.id, "2099-05"))[0]!.status).toBe("matched");
+
+    await updateRecurringPattern(db, household.id, created.id, { dayOfMonth: 20, expectedAmountCents: 15_000 });
+
+    const marchAfter = await listOccurrences(db, household.id, "2099-03");
+    expect(marchAfter.map((o) => [o.due_date, o.amount_override_cents, o.amount_cents])).toEqual([
+      ["2099-03-05", 12_345, 15_000],
+      ["2099-03-20", null, 15_000],
+    ]);
+    const aprilAfter = await listOccurrences(db, household.id, "2099-04");
+    expect(aprilAfter.find((o) => o.due_date === "2099-04-05")?.status).toBe("skipped");
+    const mayAfter = await listOccurrences(db, household.id, "2099-05");
+    const matched = mayAfter.find((o) => o.due_date === "2099-05-05")!;
+    expect(matched.status).toBe("matched");
+    expect(matched.amount_cents).toBe(9_950);
+    // Once paid, what it actually cost is the answer, whatever was projected.
+    expect(resolveOccurrenceAmountCents({ ...matched, amount_override_cents: 11_111 }, created)).toBe(9_950);
   });
 });

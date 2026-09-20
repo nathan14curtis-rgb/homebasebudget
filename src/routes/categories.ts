@@ -2,7 +2,15 @@ import Anthropic from "@anthropic-ai/sdk";
 import { Hono } from "hono";
 import { requireParam } from "../lib/http";
 import type { CategoryKind, Env } from "../types";
-import { archiveCategory, createCategory, createEnvelopeForCategory, listCategories, renameCategory, unarchiveCategory } from "../db/categories";
+import {
+  archiveCategory,
+  createCategory,
+  createEnvelopeForCategory,
+  findActiveCategoryByName,
+  listCategories,
+  renameCategory,
+  unarchiveCategory,
+} from "../db/categories";
 import { listUncategorizedMerchantSummary } from "../db/transactions";
 import { suggestCategories } from "../categorization/categorySuggestions";
 
@@ -30,8 +38,14 @@ categoriesRoute.post("/", async (c) => {
   }
 
   const householdId = requireParam(c, "householdId");
+  // Two active "Groceries" is never what anyone meant, and the schema
+  // can't stop it (see findActiveCategoryByName) — say so instead of
+  // quietly making a twin the person then has to notice and archive.
+  const duplicate = await findActiveCategoryByName(c.env.DB, householdId, body.name);
+  if (duplicate) return c.json({ error: `You already have a category called "${duplicate.name}" — edit that one instead.` }, 409);
+
   const category = await createCategory(c.env.DB, householdId, {
-    name: body.name,
+    name: body.name.trim(),
     kind: body.kind as CategoryKind,
     parentId: body.parentId,
   });
@@ -81,8 +95,13 @@ categoriesRoute.get("/suggest", async (c) => {
 // comment explains why); use archive + create-new for that.
 categoriesRoute.patch("/:categoryId", async (c) => {
   const body = await c.req.json<{ name?: string }>();
-  if (!body.name) return c.json({ error: "name is required" }, 400);
-  const category = await renameCategory(c.env.DB, requireParam(c, "householdId"), requireParam(c, "categoryId"), body.name);
+  if (!body.name?.trim()) return c.json({ error: "name is required" }, 400);
+  const categoryId = requireParam(c, "categoryId");
+  const duplicate = await findActiveCategoryByName(c.env.DB, requireParam(c, "householdId"), body.name);
+  if (duplicate && duplicate.id !== categoryId) {
+    return c.json({ error: `You already have a category called "${duplicate.name}".` }, 409);
+  }
+  const category = await renameCategory(c.env.DB, requireParam(c, "householdId"), categoryId, body.name.trim());
   return c.json(category);
 });
 

@@ -4,6 +4,7 @@ import type { Env } from "../types";
 import {
   allocateToEnvelope,
   applyRolloverResets,
+  fundEnvelopesToTarget,
   getEnvelopeMonthSummariesForHousehold,
   getEnvelopeMonthSummary,
   listEnvelopes,
@@ -78,6 +79,23 @@ envelopesRoute.post("/:envelopeId/allocate", async (c) => {
     createdByUserId: body.createdByUserId,
   });
   return c.json({ ok: true }, 201);
+});
+
+// "Fund to target": bring envelopes up to their monthly targets for the
+// month as allocation rows, all of them or just the ones named. Without
+// this the dashboard could set a target but never fund it, so every
+// envelope read as over budget from its first purchase.
+envelopesRoute.post("/fund", async (c) => {
+  const body = await c.req.json<{ month?: string; envelopeIds?: string[]; topUpOnly?: boolean; createdByUserId?: string }>();
+  if (!body.month || !MONTH_RE.test(body.month)) return c.json({ error: "month must be 'YYYY-MM'" }, 400);
+  if (body.envelopeIds !== undefined && !Array.isArray(body.envelopeIds)) return c.json({ error: "envelopeIds must be a list" }, 400);
+  const funded = await fundEnvelopesToTarget(c.env.DB, requireParam(c, "householdId"), {
+    month: body.month,
+    envelopeIds: body.envelopeIds,
+    topUpOnly: body.topUpOnly,
+    createdByUserId: body.createdByUserId,
+  });
+  return c.json({ funded, totalCents: funded.reduce((sum, f) => sum + f.amountCents, 0) }, 201);
 });
 
 // First-class, audited move between two envelopes (PLAN §8.1) — e.g.

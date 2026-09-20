@@ -2,6 +2,7 @@ import { listCategories, unarchiveCategory } from "../db/categories";
 import {
   allocateToEnvelope,
   applyRolloverResets,
+  fundEnvelopesToTarget,
   getEnvelopeMonthSummariesForHousehold,
   listEnvelopes,
   previousMonth,
@@ -298,46 +299,23 @@ const fundMonthFromPlan: AgentTool = {
     const topUpOnly = bool(input, "top_up_only") ?? true;
     const only = (arr(input, "categories") as unknown[]).filter((c): c is string => typeof c === "string");
 
-    await applyRolloverResets(env.DB, ctx.householdId, month);
-    const [envelopes, categories, summaries] = await Promise.all([
-      listEnvelopes(env.DB, ctx.householdId),
-      listCategories(env.DB, ctx.householdId),
-      getEnvelopeMonthSummariesForHousehold(env.DB, ctx.householdId, month),
-    ]);
+    const [envelopes, categories] = await Promise.all([listEnvelopes(env.DB, ctx.householdId), listCategories(env.DB, ctx.householdId)]);
     const categoryById = new Map(categories.map((c) => [c.id, c]));
+    const envelopeById = new Map(envelopes.map((e) => [e.id, e]));
 
     const wanted = new Set<string>();
     for (const name of only) wanted.add((await resolveCategory(env, ctx.householdId, name)).id);
+    const envelopeIds = wanted.size > 0 ? envelopes.filter((e) => wanted.has(e.category_id)).map((e) => e.id) : undefined;
 
-    const entries: Array<{ envelopeId: string; month: string; amountCents: number }> = [];
-    const funded: unknown[] = [];
-    let totalCents = 0;
-    for (const envelope of envelopes) {
-      if (envelope.archived_at) continue;
-      if (wanted.size > 0 && !wanted.has(envelope.category_id)) continue;
-      const target = envelope.monthly_target_cents;
-      if (target === null) continue;
-      const summary = summaries[envelope.id];
-      if (!summary) continue;
-      const available = summary.carriedInCents + summary.allocatedCents;
-      const delta = target - available;
-      if (delta === 0 || (topUpOnly && delta < 0)) continue;
-
-      await allocateToEnvelope(env.DB, ctx.householdId, {
-        envelopeId: envelope.id,
-        month,
-        amountCents: delta,
-        note: `funded to plan for ${month}`,
-        createdByUserId: ctx.userId,
-      });
-      entries.push({ envelopeId: envelope.id, month, amountCents: delta });
-      totalCents += delta;
-      funded.push({
-        category: categoryById.get(envelope.category_id)?.name ?? "?",
-        added_dollars: toDollars(delta),
-        now_available_dollars: toDollars(available + delta),
-      });
-    }
+    // The same funding the dashboard's "Fund to target" does (src/db/envelopes.ts).
+    const written = await fundEnvelopesToTarget(env.DB, ctx.householdId, { month, envelopeIds, topUpOnly, createdByUserId: ctx.userId });
+    const entries = written.map(({ envelopeId, month: m, amountCents }) => ({ envelopeId, month: m, amountCents }));
+    const totalCents = written.reduce((sum, w) => sum + w.amountCents, 0);
+    const funded = written.map((w) => ({
+      category: categoryById.get(envelopeById.get(w.envelopeId)?.category_id ?? "")?.name ?? "?",
+      added_dollars: toDollars(w.amountCents),
+      now_available_dollars: toDollars(w.availableAfterCents),
+    }));
 
     if (entries.length === 0) return { month, funded: [], total_dollars: 0, note: "every envelope was already funded to its target" };
     ctx.record({

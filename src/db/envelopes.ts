@@ -118,6 +118,50 @@ export async function allocateToEnvelope(
   await stmt.run();
 }
 
+/**
+ * Bring every envelope with a monthly target up to that target for the
+ * month, as allocation rows (PLAN.md §8 "fund all to target"). What an
+ * envelope already has going into the month — what carried in plus what
+ * has been allocated so far — counts toward the target, so funding twice
+ * adds nothing the second time. With `topUpOnly` (the default) an
+ * envelope sitting above its target is left alone; without it, the excess
+ * is taken back out. Returns the rows written, which is also what an undo
+ * needs. Shared by the dashboard's "Fund to target" and the texting
+ * agent's fund_month_from_plan so both do exactly the same thing.
+ */
+export async function fundEnvelopesToTarget(
+  db: D1Database,
+  householdId: string,
+  input: { month: string; envelopeIds?: string[]; topUpOnly?: boolean; createdByUserId?: string | null; note?: string },
+): Promise<Array<{ envelopeId: string; month: string; amountCents: number; availableAfterCents: number }>> {
+  const topUpOnly = input.topUpOnly ?? true;
+  const only = input.envelopeIds ? new Set(input.envelopeIds) : null;
+  await applyRolloverResets(db, householdId, input.month);
+  const [envelopes, summaries] = await Promise.all([listEnvelopes(db, householdId), getEnvelopeMonthSummariesForHousehold(db, householdId, input.month)]);
+
+  const entries: Array<{ envelopeId: string; month: string; amountCents: number; availableAfterCents: number }> = [];
+  for (const envelope of envelopes) {
+    if (envelope.archived_at) continue;
+    if (only && !only.has(envelope.id)) continue;
+    const target = envelope.monthly_target_cents;
+    if (target === null) continue;
+    const summary = summaries[envelope.id];
+    if (!summary) continue;
+    const available = summary.carriedInCents + summary.allocatedCents;
+    const delta = target - available;
+    if (delta === 0 || (topUpOnly && delta < 0)) continue;
+    await allocateToEnvelope(db, householdId, {
+      envelopeId: envelope.id,
+      month: input.month,
+      amountCents: delta,
+      note: input.note ?? `funded to plan for ${input.month}`,
+      createdByUserId: input.createdByUserId,
+    });
+    entries.push({ envelopeId: envelope.id, month: input.month, amountCents: delta, availableAfterCents: available + delta });
+  }
+  return entries;
+}
+
 /** Move money between two envelopes as one atomic, fully-reversible
  * operation (PLAN.md §8.1): two ledger rows, each pointing at the other. */
 export async function moveMoneyBetweenEnvelopes(

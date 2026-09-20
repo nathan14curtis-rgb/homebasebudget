@@ -76,14 +76,17 @@ export function dueDatesInMonth(pattern: RecurringPattern, month: string): strin
   return clamped.map((d) => isoDate(year, monthIndex0, d));
 }
 
-/** What an occurrence should show: a one-month override wins, then the
- * amount captured when it was generated, then the series' expected amount.
- * Null means "no figure yet" — the UI shows a dash rather than $0.00,
- * which would read as a real, zero-dollar bill. */
+/** What an occurrence should show. Once a transaction has matched, what
+ * it actually cost is the answer, whatever was projected or overridden
+ * beforehand. Before that, a one-month override wins, then the amount
+ * captured when it was generated, then the series' expected amount. Null
+ * means "no figure yet" — the UI shows a dash rather than $0.00, which
+ * would read as a real, zero-dollar bill. */
 export function resolveOccurrenceAmountCents(
-  occurrence: Pick<SeriesOccurrence, "amount_cents" | "amount_override_cents">,
+  occurrence: Pick<SeriesOccurrence, "amount_cents" | "amount_override_cents"> & Partial<Pick<SeriesOccurrence, "status">>,
   pattern: Pick<RecurringPattern, "expected_amount_cents"> | undefined,
 ): number | null {
+  if (occurrence.status === "matched" && occurrence.amount_cents !== null) return occurrence.amount_cents;
   if (occurrence.amount_override_cents !== null) return occurrence.amount_override_cents;
   if (occurrence.amount_cents !== null) return occurrence.amount_cents;
   return pattern?.expected_amount_cents ?? null;
@@ -339,6 +342,72 @@ export async function unlinkOccurrence(db: D1Database, householdId: string, id: 
     .bind(unlinked, now, id, householdId)
     .run();
   return { ...existing, status: "upcoming", matched_transaction_id: null, unlinked_transaction_id: unlinked, updated_at: now };
+}
+
+/**
+ * Bring a series' still-upcoming occurrences back in line with the series
+ * after it has been edited.
+ *
+ * Generation copies the expected amount into each row and only ever
+ * inserts, so without this an edited amount never reaches the squares
+ * already on the calendar, and a moved day leaves the old square behind
+ * next to the new one. From the current month forward, an untouched
+ * upcoming row (no override, not moved by hand) is deleted when its date
+ * is no longer on the schedule and re-seeded with the new expected amount
+ * when it is; a row someone edited by hand keeps its edits but still
+ * picks up the new amount underneath any override. Matched and skipped
+ * rows are history and are left exactly as they are. The next read of the
+ * month generates whatever new dates the schedule now calls for.
+ */
+export async function realignOccurrences(
+  db: D1Database,
+  householdId: string,
+  pattern: RecurringPattern,
+  fromMonth: string = nowIso().slice(0, 7),
+): Promise<{ removed: number; reseeded: number }> {
+  assertMonth(fromMonth);
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM series_occurrence WHERE household_id = ? AND pattern_id = ? AND status = 'upcoming' AND scheduled_date >= ?`,
+    )
+    .bind(householdId, pattern.id, `${fromMonth}-01`)
+    .all<SeriesOccurrence>();
+
+  const onSchedule = new Map<string, Set<string>>();
+  function stillScheduled(scheduledDate: string): boolean {
+    if (pattern.status !== "confirmed" || pattern.category_id === null) return false;
+    if (pattern.ended_at && scheduledDate > pattern.ended_at.slice(0, 10)) return false;
+    const month = scheduledDate.slice(0, 7);
+    let dates = onSchedule.get(month);
+    if (!dates) {
+      dates = new Set(dueDatesInMonth(pattern, month));
+      onSchedule.set(month, dates);
+    }
+    return dates.has(scheduledDate);
+  }
+
+  const now = nowIso();
+  const writes: D1PreparedStatement[] = [];
+  let removed = 0;
+  let reseeded = 0;
+  for (const occurrence of results) {
+    const touched = occurrence.amount_override_cents !== null || occurrence.due_date !== occurrence.scheduled_date;
+    if (!touched && !stillScheduled(occurrence.scheduled_date)) {
+      writes.push(db.prepare(`DELETE FROM series_occurrence WHERE id = ? AND household_id = ?`).bind(occurrence.id, householdId));
+      removed++;
+      continue;
+    }
+    if (occurrence.amount_cents !== pattern.expected_amount_cents) {
+      writes.push(
+        db
+          .prepare(`UPDATE series_occurrence SET amount_cents = ?, updated_at = ? WHERE id = ? AND household_id = ?`)
+          .bind(pattern.expected_amount_cents, now, occurrence.id, householdId),
+      );
+      reseeded++;
+    }
+  }
+  if (writes.length > 0) await db.batch(writes);
+  return { removed, reseeded };
 }
 
 /** Every occurrence in the month, after a sync. */

@@ -21,6 +21,7 @@ import { occurrencesRoute } from "./routes/occurrences";
 import { tagsRoute } from "./routes/tags";
 import { messagingDiagnosticsRoute } from "./routes/messagingDiagnostics";
 import { chatRoute } from "./routes/chat";
+import { budgetRoute } from "./routes/budgetCsv";
 import { plaidWebhookRoute } from "./routes/plaidWebhook";
 import { sendblueWebhookRoute } from "./routes/sendblueWebhook";
 import { handleQueueBatch } from "./queue/consumer";
@@ -78,6 +79,7 @@ scoped.route("/:householdId/maintenance", maintenanceRoute);
 scoped.route("/:householdId/recurring-patterns", recurringPatternsRoute);
 scoped.route("/:householdId/occurrences", occurrencesRoute);
 scoped.route("/:householdId/tags", tagsRoute);
+scoped.route("/:householdId/budget", budgetRoute);
 scoped.route("/:householdId/messaging", messagingDiagnosticsRoute);
 // The same conversational agent the iMessage loop uses, from the dashboard.
 scoped.route("/:householdId/chat", chatRoute);

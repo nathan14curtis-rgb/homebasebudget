@@ -120,9 +120,17 @@ function SeriesFormModal({
   onSaved: () => Promise<void>;
 }) {
   const editing = Boolean(pattern);
+  // A detected series arrives as a suggestion with no category of its own.
+  // "Add to calendar" is what confirms it — a PATCH alone leaves it
+  // suggested, and a suggested series projects nothing.
+  const confirming = pattern?.status === "suggested";
   const existingCategory = pattern
     ? categories.find((c) => c.id === pattern.category_id)
     : undefined;
+  // A series that already has a category is renamed in place; only a new
+  // or still-unfiled one gets to pick between "name a new one" and "use
+  // one that exists".
+  const choosingCategory = !existingCategory;
   const existingEnvelope = pattern
     ? envelopes.find((e) => e.category_id === pattern.category_id)
     : undefined;
@@ -130,10 +138,9 @@ function SeriesFormModal({
   const [kind, setKind] = useState<"expense" | "income">(
     pattern?.kind ?? "expense",
   );
-  const [nameMode, setNameMode] = useState<"new" | "existing">(
-    editing ? "existing" : "new",
-  );
+  const [nameMode, setNameMode] = useState<"new" | "existing">("new");
   const [newName, setNewName] = useState("");
+  const [renameTo, setRenameTo] = useState(existingCategory?.name ?? "");
   const [categoryId, setCategoryId] = useState(pattern?.category_id ?? "");
   const [amount, setAmount] = useState(() => {
     const cents =
@@ -197,14 +204,17 @@ function SeriesFormModal({
     if (!amount.trim()) setAmount(centsToInput(t.amount_cents));
   }
 
+  function chosenName() {
+    if (!choosingCategory) return renameTo.trim();
+    return nameMode === "new"
+      ? newName.trim()
+      : (selectableCategories.find((c) => c.id === categoryId)?.name ?? "");
+  }
+
   async function save() {
-    const name =
-      nameMode === "new"
-        ? newName.trim()
-        : (selectableCategories.find((c) => c.id === categoryId)?.name ?? "");
-    if (nameMode === "new" && !name)
-      return action.showError(`Give this ${noun} a name.`);
-    if (nameMode === "existing" && !categoryId)
+    const name = chosenName();
+    if (!name) return action.showError(`Give this ${noun} a name.`);
+    if (choosingCategory && nameMode === "existing" && !categoryId)
       return action.showError(VALIDATION.category);
     if (!scheduleIsValid(schedule))
       return action.showError("Fill in when it repeats.");
@@ -226,46 +236,56 @@ function SeriesFormModal({
   }
 
   async function write() {
-    const name =
-      nameMode === "new"
-        ? newName.trim()
-        : (selectableCategories.find((c) => c.id === categoryId)?.name ?? "");
+    const name = chosenName();
     const amountCents = amount.trim() ? parseMoney(amount) : null;
-    if (pattern) {
-      await api.updateRecurringPattern(householdId, pattern.id, {
-        // The merchant defaults to the name so a hand-entered bill still
-        // auto-matches when it eventually shows up on a statement.
-        merchantPattern: merchantPattern.trim() || name,
-        categoryId: nameMode === "existing" ? categoryId : undefined,
+    // The merchant defaults to the name so a hand-entered bill still
+    // auto-matches when it eventually shows up on a statement.
+    const merchant = merchantPattern.trim() || pattern?.merchant_pattern || name;
+    // When naming a new category, a name that already exists (case aside)
+    // is that category — the server refuses a duplicate name, and a second
+    // "Electric" would never link to the charges filed under the first.
+    const sameName = selectableCategories.find(
+      (c) => c.name.trim().toLowerCase() === name.toLowerCase(),
+    );
+    const chosenCategoryId = !choosingCategory
+      ? existingCategory?.id
+      : nameMode === "existing"
+        ? categoryId
+        : sameName?.id;
+    const schedulePart = scheduleToApiInput(schedule);
+
+    if (pattern && confirming) {
+      // Confirm and set everything in one call; the server files the
+      // series under its category and brings the envelope in step.
+      await api.confirmRecurringPattern(householdId, pattern.id, {
+        categoryId: chosenCategoryId,
+        newCategoryName: chosenCategoryId ? undefined : name,
+        kind,
+        merchantPattern: merchant,
         expectedAmountCents: amountCents,
-        ...scheduleToApiInput(schedule),
+        ...schedulePart,
       });
-      if (
-        existingCategory &&
-        nameMode === "existing" &&
-        categoryId === existingCategory.id &&
-        name !== existingCategory.name
-      ) {
+    } else if (pattern) {
+      // The server re-seeds the projected months and mirrors the amount to
+      // the envelope, so nothing has to be patched twice from here.
+      await api.updateRecurringPattern(householdId, pattern.id, {
+        merchantPattern: merchant,
+        expectedAmountCents: amountCents,
+        ...schedulePart,
+      });
+      if (existingCategory && name !== existingCategory.name) {
         await api.renameCategory(householdId, existingCategory.id, name);
-      }
-      // A bill's envelope target is what the Spending Plan reserves for
-      // it, so keeping it in step with the expected amount is the whole
-      // reason the two pages agree.
-      if (existingEnvelope && amountCents !== null && kind === "expense") {
-        await api.updateEnvelope(householdId, existingEnvelope.id, {
-          monthlyTargetCents: amountCents,
-        });
       }
     } else {
       await api.createRecurringPattern(householdId, {
-        merchantPattern: merchantPattern.trim() || name,
+        merchantPattern: merchant,
         kind,
-        categoryId: nameMode === "existing" ? categoryId : undefined,
-        newCategoryName: nameMode === "new" ? name : undefined,
+        categoryId: chosenCategoryId,
+        newCategoryName: chosenCategoryId ? undefined : name,
         monthlyTargetCents:
           kind === "expense" && amountCents !== null ? amountCents : undefined,
         expectedAmountCents: amountCents ?? undefined,
-        ...scheduleToApiInput(schedule),
+        ...schedulePart,
       });
     }
   }
@@ -273,9 +293,11 @@ function SeriesFormModal({
   return (
     <Modal
       title={
-        editing
-          ? `Edit ${existingCategory?.name ?? "series"}`
-          : "Add a bill or income"
+        confirming
+          ? `Add ${pattern?.merchant_pattern ?? "this"} to the calendar`
+          : editing
+            ? `Edit ${existingCategory?.name ?? "series"}`
+            : "Add a bill or income"
       }
       onClose={onClose}
       footer={
@@ -289,7 +311,13 @@ function SeriesFormModal({
             Cancel
           </button>
           <button type="button" onClick={save} disabled={saving}>
-            {saving ? "Saving…" : editing ? "Save" : `Add ${noun}`}
+            {saving
+              ? "Saving…"
+              : confirming
+                ? "Add to calendar"
+                : editing
+                  ? "Save"
+                  : `Add ${noun}`}
           </button>
         </>
       }
@@ -332,7 +360,21 @@ function SeriesFormModal({
 
       <div className="field">
         <label htmlFor="series-name">Name</label>
-        {nameMode === "new" ? (
+        {!choosingCategory ? (
+          <>
+            <input
+              id="series-name"
+              type="text"
+              data-autofocus="true"
+              value={renameTo}
+              onChange={(e) => setRenameTo(e.target.value)}
+            />
+            <p className="hint">
+              Also the name of its category and envelope — renaming here
+              renames all three.
+            </p>
+          </>
+        ) : nameMode === "new" ? (
           <input
             id="series-name"
             type="text"
@@ -358,16 +400,20 @@ function SeriesFormModal({
             ))}
           </select>
         )}
-        <button
-          type="button"
-          className="link-button"
-          onClick={() => setNameMode((m) => (m === "new" ? "existing" : "new"))}
-          disabled={nameMode === "new" && selectableCategories.length === 0}
-        >
-          {nameMode === "new"
-            ? "Pick one that already exists instead"
-            : "Name a new one instead"}
-        </button>
+        {choosingCategory && (
+          <button
+            type="button"
+            className="link-button"
+            onClick={() =>
+              setNameMode((m) => (m === "new" ? "existing" : "new"))
+            }
+            disabled={nameMode === "new" && selectableCategories.length === 0}
+          >
+            {nameMode === "new"
+              ? "Pick one that already exists instead"
+              : "Name a new one instead"}
+          </button>
+        )}
       </div>
 
       <div className="field">
@@ -481,10 +527,11 @@ function OccurrenceModal({
   onOpenTransaction: (transaction: Transaction) => void;
 }) {
   const { occurrence, pattern } = tile;
-  const [amount, setAmount] = useState(() => {
+  const initialAmount = useMemo(() => {
     const cents = occurrenceAmountCents(occurrence, pattern);
     return cents === null ? "" : centsToInput(cents);
-  });
+  }, [occurrence, pattern]);
+  const [amount, setAmount] = useState(initialAmount);
   const [dueDate, setDueDate] = useState(occurrence.due_date);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [confirmingUnlink, setConfirmingUnlink] = useState(false);
@@ -509,9 +556,12 @@ function OccurrenceModal({
       );
       return;
     }
+    // An untouched amount is not an override. Sending one anyway pinned the
+    // expected amount over what the statement later showed.
+    const amountChanged = trimmed !== initialAmount.trim();
     void run(() =>
       api.updateOccurrence(householdId, occurrence.id, {
-        amountOverrideCents,
+        ...(amountChanged ? { amountOverrideCents } : {}),
         dueDate,
       }),
     );
@@ -737,6 +787,20 @@ export function BillsIncomePage({
 
   const refresh = recurring.refresh;
 
+  /** Categories a confirmed series lives in. Their envelopes are bills,
+   * whatever group they sit in, so the everyday per-diem leaves them out —
+   * otherwise a bill is counted once on the calendar and again as daily
+   * spending. */
+  const billCategoryIds = useMemo(
+    () =>
+      new Set(
+        patterns
+          .filter((p) => p.status === "confirmed" && p.category_id)
+          .map((p) => p.category_id!),
+      ),
+    [patterns],
+  );
+
   // The projection needs every month between today and the one on screen,
   // not just the visible one: a future month's estimate that skipped the
   // bills in between would start from the wrong balance.
@@ -831,7 +895,8 @@ export function BillsIncomePage({
         startingCashCents: cashOnHandCents(accounts),
         occurrencesByMonth,
         patternById,
-        perDiemCentsForMonth: (m) => perDiemCents(envelopes, categoryById, m),
+        perDiemCentsForMonth: (m) =>
+          perDiemCents(envelopes, categoryById, m, billCategoryIds),
       }),
     [
       month,
@@ -841,6 +906,7 @@ export function BillsIncomePage({
       patternById,
       envelopes,
       categoryById,
+      billCategoryIds,
     ],
   );
 
@@ -925,7 +991,7 @@ export function BillsIncomePage({
     [patterns],
   );
   const isCurrentMonth = month === today.slice(0, 7);
-  const perDiem = perDiemCents(envelopes, categoryById, month);
+  const perDiem = perDiemCents(envelopes, categoryById, month, billCategoryIds);
 
   return (
     <div className="section">

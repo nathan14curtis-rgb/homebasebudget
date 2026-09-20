@@ -21,6 +21,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { MoneyInput } from "./MoneyInput";
 import { Notice, useAction } from "./Notice";
 import { EmptyState } from "./EmptyState";
+import { BudgetCsvSection } from "./BudgetCsvSection";
 import { IncludedExcludedList, PlanRow, planItemDate, type PlanItem } from "./PlanRow";
 
 const DEFAULT_GROUP = "Everyday";
@@ -228,6 +229,24 @@ function EnvelopeRow({
   const txnCount = items.filter((i) => i.kind === "transaction" && !i.transaction.excluded_from_budget).length;
   const isGoal = category?.kind === "savings";
 
+  // A target is a plan, not money: until this month's allocation ledger
+  // holds the planned amount, "available to spend" starts at zero and the
+  // first purchase reads as over budget. This is what's actually in it.
+  const fundedCents = (summary?.carriedInCents ?? 0) + (summary?.allocatedCents ?? 0);
+  const unfunded = target !== null && !isGoal && fundedCents < target;
+
+  function fundToTarget() {
+    if (target === null) return;
+    const shortfall = target - fundedCents;
+    void action.run(
+      async () => {
+        await api.fundEnvelopes(householdId, { month: currentMonth(), envelopeIds: [envelope.id] });
+        await onChanged();
+      },
+      { success: `${formatCents(shortfall)} put into ${category?.name ?? "this envelope"} for this month.` },
+    );
+  }
+
   /** Whether this envelope's leftovers survive the turn of the month. The
    * per-month adjustments ("release", "change rollover amount") fix one
    * month; this is the standing answer, and the backend settles it with a
@@ -348,17 +367,25 @@ function EnvelopeRow({
               ? "Saved so far"
               : target === null
                 ? "Spent this month"
-                : over
-                  ? "Over budget"
-                  : rolloverCents > 0
-                    ? "Available with rollover"
-                    : "Available to spend"}
+                : unfunded
+                  ? "Not funded to target yet"
+                  : over
+                    ? "Over budget"
+                    : rolloverCents > 0
+                      ? "Available with rollover"
+                      : "Available to spend"}
           </div>
+          {unfunded && target !== null && (
+            <button type="button" className="link-button" disabled={action.busy} onClick={fundToTarget} style={{ fontSize: 12 }}>
+              Fund {formatCents(target - fundedCents)} to target
+            </button>
+          )}
         </div>
 
         <EnvelopeMenu
           actions={[
             { label: "Edit", icon: "✎", onClick: onEdit },
+            { label: "Fund to target", icon: "＄", disabled: target === null || isGoal || fundedCents >= target || action.busy, onClick: fundToTarget },
             { label: "Release unspent funds", icon: "↩", disabled: rolloverCents <= 0 || action.busy, onClick: () => onRelease(rolloverCents) },
             { label: "Change rollover amount", icon: "⇄", onClick: onAdjustRollover },
             {
@@ -853,6 +880,38 @@ export function EnvelopesPage({
     await Promise.all([onChanged(), onTransactionsChanged()]);
   }
 
+  /** A CSV upload can touch envelopes, goals, bills and income at once. */
+  async function refreshAfterBulkEdit() {
+    await Promise.all([onChanged(), onTransactionsChanged(), recurring.refresh()]);
+  }
+
+  /** How much this month's planned spending is still short of being funded. */
+  const shortfallCents = useMemo(
+    () =>
+      plannedEnvelopes
+        .filter((e) => categoryById.get(e.category_id)?.kind === "expense")
+        .reduce((sum, e) => {
+          const target = e.monthly_target_cents ?? 0;
+          const summary = envelopeSummaries[e.id];
+          const funded = (summary?.carriedInCents ?? 0) + (summary?.allocatedCents ?? 0);
+          return sum + Math.max(0, target - funded);
+        }, 0),
+    [plannedEnvelopes, categoryById, envelopeSummaries],
+  );
+
+  function fundAllToTarget() {
+    const expenseIds = plannedEnvelopes.filter((e) => categoryById.get(e.category_id)?.kind === "expense").map((e) => e.id);
+    if (expenseIds.length === 0) return;
+    void page.run(
+      async () => {
+        const result = await api.fundEnvelopes(householdId, { month, envelopeIds: expenseIds });
+        await onChanged();
+        return result;
+      },
+      { key: "fund-all", success: `${formatCents(shortfallCents)} put into this month's envelopes.` },
+    );
+  }
+
   function toggleExcluded(transaction: Transaction) {
     const name = transaction.normalized_merchant ?? transaction.raw_description;
     void page.run(
@@ -1000,6 +1059,11 @@ export function EnvelopesPage({
               .
             </p>
           </div>
+          {shortfallCents > 0 && (
+            <button type="button" className="secondary" onClick={fundAllToTarget} disabled={page.busyKey === "fund-all"}>
+              {page.busyKey === "fund-all" ? "Funding…" : `Fund all to target (${formatCents(shortfallCents)})`}
+            </button>
+          )}
         </div>
 
         {groupedPlanned.length > 0 ? (
@@ -1114,6 +1178,8 @@ export function EnvelopesPage({
         )}
         <Notice notice={suggest.notice} onDismiss={suggest.clear} style={{ marginTop: 12 }} />
       </section>
+
+      <BudgetCsvSection householdId={householdId} onChanged={refreshAfterBulkEdit} />
 
       {editingEnvelope && (
         <EditEnvelopeModal
