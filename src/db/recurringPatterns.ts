@@ -2,11 +2,21 @@ import { newId } from "../lib/id";
 import type { RecurringPattern, RecurringPatternFrequency, RecurringPatternKind, RecurringPatternStatus } from "../types";
 import { nowIso } from "./client";
 import { realignOccurrences } from "../envelopes/occurrences";
+import { canonicalMerchantKey } from "../lib/merchant";
+import {
+  DEFAULT_DAY_TOLERANCE,
+  dayDistance,
+  dayOfMonth,
+  dayOfWeek,
+  inferRecurringSeries,
+  type DetectableTransaction,
+} from "../lib/recurringDetection";
 
-const MIN_OCCURRENCES = 2;
-const MIN_DISTINCT_MONTHS = 2;
-const DEFAULT_DAY_TOLERANCE = 4;
-const LOOKBACK_MONTHS = 6;
+/** How far back detection looks. Plaid's initial sync carries up to two
+ * years, so a year is enough to see a series several times over without
+ * resurrecting bills that ended long ago (recency is checked separately
+ * in src/lib/recurringDetection.ts). */
+const LOOKBACK_MONTHS = 12;
 
 export async function listRecurringPatterns(
   db: D1Database,
@@ -26,129 +36,75 @@ export async function listRecurringPatterns(
   return results;
 }
 
-function dayOfMonth(postedAt: string): number {
-  return Number(postedAt.slice(8, 10));
-}
-
-/** 0=Sunday..6=Saturday, for weekly-frequency matching. postedAt is an ISO
- * date ('YYYY-MM-DD'); Date.parse on a bare date is UTC, which is fine
- * here since only the day-of-week within that date matters. */
-function dayOfWeek(postedAt: string): number {
-  return new Date(`${postedAt}T00:00:00Z`).getUTCDay();
-}
-
-function monthKey(postedAt: string): string {
-  return postedAt.slice(0, 7);
-}
-
-/** Circular distance between two days-of-month over a ~30-day month —
- * "the 30th" and "the 1st" are 2 days apart, not 29, so a bill that lands
- * right at month-end doesn't get treated as a mismatch every other month. */
-function dayDistance(a: number, b: number, monthLength = 30): number {
-  const diff = Math.abs(a - b);
-  return Math.min(diff, monthLength - diff);
-}
-
-/** Median magnitude of a group's amounts, in cents — a series' expected
- * amount is the middle of what it has actually charged, not the mean,
- * so one anomalous month doesn't drag the projection with it. Always
- * positive: sign is the pattern's `kind`, not the amount's. */
-function medianAmountCents(rows: { amount_cents: number }[]): number | null {
-  if (rows.length === 0) return null;
-  const magnitudes = rows.map((r) => Math.abs(r.amount_cents)).sort((a, b) => a - b);
-  return magnitudes[Math.floor(magnitudes.length / 2)]!;
-}
-
-interface DetectableTransaction {
-  normalized_merchant: string | null;
-  raw_description: string;
-  amount_cents: number;
-  posted_at: string;
-}
-
 function merchantKey(t: DetectableTransaction): string {
   return (t.normalized_merchant ?? t.raw_description).trim().toUpperCase();
 }
 
 /**
- * Vendor + day-of-month recurrence, not exact amount — a utility bill that's
+ * Vendor + cadence recurrence, not exact amount — a utility bill that's
  * $200 one month and $240 the next from the same merchant around the same
  * day is still the same recurring bill (and the same shape applies to
- * recurring income, e.g. a paycheck). Scans the household's own history
- * rather than requiring the person to describe the pattern up front; run
- * after a Plaid sync (src/plaid/sync.ts) and on demand from the Recurring
- * page. Never touches a merchant+kind combo that already has a pattern row
- * (suggested, confirmed, or dismissed) — dismissing a false positive once
- * should stick, not get re-suggested on the next sync.
+ * recurring income, e.g. a paycheck). The inference itself lives in
+ * src/lib/recurringDetection.ts (weekly / biweekly / twice-monthly /
+ * monthly, with amount clustering and outlier tolerance); this scans the
+ * household's own history rather than requiring the person to describe
+ * the pattern up front, and runs after a Plaid sync (src/plaid/sync.ts)
+ * and on demand from the Bills page. Never touches a merchant+kind combo
+ * that already has a pattern row (suggested, confirmed, or dismissed) —
+ * dismissing a false positive once should stick, not get re-suggested on
+ * the next sync. "Already has" is a substring match either way, so a
+ * confirmed NETFLIX blocks a NETFLIX.COM suggestion and vice versa.
  */
-export async function detectRecurringPatterns(db: D1Database, householdId: string): Promise<RecurringPattern[]> {
-  const since = new Date();
-  since.setMonth(since.getMonth() - LOOKBACK_MONTHS);
+export async function detectRecurringPatterns(
+  db: D1Database,
+  householdId: string,
+  today: string = nowIso().slice(0, 10),
+): Promise<RecurringPattern[]> {
+  const since = new Date(`${today}T00:00:00Z`);
+  since.setUTCMonth(since.getUTCMonth() - LOOKBACK_MONTHS);
   const sinceStr = since.toISOString().slice(0, 10);
 
   const [{ results: transactions }, existing] = await Promise.all([
     db
       .prepare(
         `SELECT normalized_merchant, raw_description, amount_cents, posted_at FROM "transaction"
-           WHERE household_id = ? AND is_transfer = 0 AND excluded_from_budget = 0 AND posted_at >= ?`,
+           WHERE household_id = ? AND is_transfer = 0 AND excluded_from_budget = 0 AND split_parent_id IS NULL AND posted_at >= ?`,
       )
       .bind(householdId, sinceStr)
       .all<DetectableTransaction>(),
     listRecurringPatterns(db, householdId),
   ]);
 
-  const alreadyCovered = new Set(existing.map((p) => `${p.merchant_pattern}::${p.kind}`));
+  const isCovered = (merchant: string, kind: RecurringPatternKind) =>
+    existing.some((p) => p.kind === kind && (merchant.includes(p.merchant_pattern) || p.merchant_pattern.includes(merchant)));
 
-  const groups = new Map<string, { kind: RecurringPatternKind; rows: DetectableTransaction[] }>();
-  for (const t of transactions) {
-    if (t.amount_cents === 0) continue;
-    const kind: RecurringPatternKind = t.amount_cents < 0 ? "expense" : "income";
-    const key = `${merchantKey(t)}::${kind}`;
-    if (alreadyCovered.has(key)) continue;
-    const group = groups.get(key) ?? { kind, rows: [] };
-    group.rows.push(t);
-    groups.set(key, group);
-  }
+  const suggestions = inferRecurringSeries(transactions, { today, isCovered });
 
   const now = nowIso();
   const created: RecurringPattern[] = [];
-  for (const [key, group] of groups) {
-    if (group.rows.length < MIN_OCCURRENCES) continue;
-    const distinctMonths = new Set(group.rows.map((t) => monthKey(t.posted_at)));
-    if (distinctMonths.size < MIN_DISTINCT_MONTHS) continue;
-
-    const days = group.rows.map((t) => dayOfMonth(t.posted_at)).sort((a, b) => a - b);
-    const medianDay = days[Math.floor(days.length / 2)]!;
-    const allWithinTolerance = days.every((d) => dayDistance(d, medianDay) <= DEFAULT_DAY_TOLERANCE);
-    if (!allWithinTolerance) continue;
-
+  for (const s of suggestions) {
     const id = newId("rpat");
-    const merchant = key.slice(0, key.lastIndexOf("::"));
-    // Seed the projected amount from the history that proved this is a
-    // series in the first place, so an occurrence has a figure to show
-    // before the next one posts (src/envelopes/occurrences.ts).
-    const expectedAmountCents = medianAmountCents(group.rows);
     await db
       .prepare(
-        `INSERT INTO recurring_pattern (id, household_id, category_id, merchant_pattern, kind, day_of_month, day_tolerance, status, sample_count, expected_amount_cents, created_at, updated_at)
-           VALUES (?, ?, NULL, ?, ?, ?, ?, 'suggested', ?, ?, ?, ?)`,
+        `INSERT INTO recurring_pattern (id, household_id, category_id, merchant_pattern, kind, frequency, day_of_month, day_of_month_2, day_of_week, day_tolerance, status, sample_count, expected_amount_cents, created_at, updated_at)
+           VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, ?, ?, ?)`,
       )
-      .bind(id, householdId, merchant, group.kind, medianDay, DEFAULT_DAY_TOLERANCE, group.rows.length, expectedAmountCents, now, now)
+      .bind(id, householdId, s.merchantPattern, s.kind, s.frequency, s.dayOfMonth, s.dayOfMonth2, s.dayOfWeek, s.dayTolerance, s.sampleCount, s.expectedAmountCents, now, now)
       .run();
     created.push({
       id,
       household_id: householdId,
       category_id: null,
-      merchant_pattern: merchant,
-      kind: group.kind,
-      frequency: "monthly",
-      day_of_month: medianDay,
-      day_of_month_2: null,
-      day_of_week: null,
-      day_tolerance: DEFAULT_DAY_TOLERANCE,
+      merchant_pattern: s.merchantPattern,
+      kind: s.kind,
+      frequency: s.frequency,
+      day_of_month: s.dayOfMonth,
+      day_of_month_2: s.dayOfMonth2,
+      day_of_week: s.dayOfWeek,
+      day_tolerance: s.dayTolerance,
       status: "suggested",
-      sample_count: group.rows.length,
-      expected_amount_cents: expectedAmountCents,
+      sample_count: s.sampleCount,
+      expected_amount_cents: s.expectedAmountCents,
       ended_at: null,
       created_at: now,
       updated_at: now,
@@ -321,14 +277,18 @@ function onSchedule(pattern: RecurringPattern, postedAt: string): boolean {
 export async function matchRecurringPattern(db: D1Database, householdId: string, txn: DetectableTransaction): Promise<string | null> {
   if (txn.amount_cents === 0) return null;
   const kind: RecurringPatternKind = txn.amount_cents < 0 ? "expense" : "income";
+  // Both the display-faithful key and the detector's canonical key, so a
+  // pattern the detector suggested ("AMAZON PRIME") matches a charge whose
+  // raw key still carries a reference token ("AMAZON PRIME*2K4L9 ...").
   const key = merchantKey(txn);
+  const canonical = canonicalMerchantKey(key);
 
   const { results } = await db
     .prepare(`SELECT * FROM recurring_pattern WHERE household_id = ? AND status = 'confirmed' AND kind = ? AND category_id IS NOT NULL`)
     .bind(householdId, kind)
     .all<RecurringPattern>();
 
-  const match = results.find((p) => key.includes(p.merchant_pattern) && onSchedule(p, txn.posted_at));
+  const match = results.find((p) => (key.includes(p.merchant_pattern) || canonical.includes(p.merchant_pattern)) && onSchedule(p, txn.posted_at));
   return match?.category_id ?? null;
 }
 
