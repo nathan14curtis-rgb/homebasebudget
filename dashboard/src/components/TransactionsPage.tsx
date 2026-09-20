@@ -1,9 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, type Account, type Category, type Transaction, type TransactionFlagColor, type User, type VerifyState } from "../api";
 import { dayLabel, formatCents } from "../format";
+import { NEEDS_CATEGORY } from "../copy";
 import { PencilIcon } from "./icons/PencilIcon";
 import { TransactionDetailModal } from "./TransactionDetailModal";
 import { RobotIcon } from "./icons/RobotIcon";
+import { Notice, useAction } from "./Notice";
+import { EmptyState } from "./EmptyState";
 
 const FLAG_COLORS: TransactionFlagColor[] = ["red", "orange", "yellow", "green", "blue", "purple"];
 
@@ -92,8 +95,7 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
   const [verifyFilter, setVerifyFilter] = useState<VerifyFilter>("all");
   const [sizeFilter, setSizeFilter] = useState<SizeFilter>("all");
   const [quickFilter, setQuickFilter] = useState<QuickFilter>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const action = useAction();
   // The pencil opens the shared transaction detail modal rather than
   // editing in place: the same dialog the Spending Plan uses, so category,
   // amount, payee, date, account, tags, splits, note, flag and exclusion
@@ -111,14 +113,16 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
     return ownerId ? (userById.get(ownerId)?.name ?? "Shared") : "Shared";
   };
 
-  const filters = ["All", ...users.map((u) => u.name), "Uncategorized"];
+  const NEEDS_CATEGORY_FILTER = "__needsCategory";
+  const filters = ["All", ...users.map((u) => u.name), NEEDS_CATEGORY_FILTER];
+  const filterLabel = (f: string) => (f === NEEDS_CATEGORY_FILTER ? NEEDS_CATEGORY : f);
 
   const filtered = useMemo(() => {
     const merchantNeedle = merchantQuery.trim().toLowerCase();
     return transactions.filter((t) => {
       if (memberFilter === "All") {
         // no-op
-      } else if (memberFilter === "Uncategorized") {
+      } else if (memberFilter === NEEDS_CATEGORY_FILTER) {
         if (t.category_id || t.is_transfer) return false;
       } else if (memberFor(t) !== memberFilter) {
         return false;
@@ -169,6 +173,16 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
   const inCents = nonTransferFiltered.filter((t) => t.amount_cents > 0).reduce((sum, t) => sum + t.amount_cents, 0);
   const uncategorizedCount = filtered.filter((t) => !t.category_id && !t.is_transfer).length;
 
+  // Escape closes the flag menu, the way it closes every other menu.
+  useEffect(() => {
+    if (!flagMenuId) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setFlagMenuId(null);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [flagMenuId]);
+
   function openFlagMenu(transactionId: string, anchor: HTMLElement) {
     if (flagMenuId === transactionId) {
       setFlagMenuId(null);
@@ -179,17 +193,38 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
     setFlagMenuId(transactionId);
   }
 
-  async function setFlag(transactionId: string, color: TransactionFlagColor | null) {
+  function setFlag(transactionId: string, color: TransactionFlagColor | null) {
     setFlagMenuId(null);
-    setBusyId(transactionId);
-    setError(null);
-    try {
-      await api.setTransactionFlag(householdId, transactionId, color);
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update flag");
-    } finally {
-      setBusyId(null);
+    void action.run(
+      async () => {
+        await api.setTransactionFlag(householdId, transactionId, color);
+        await onChanged();
+      },
+      { key: transactionId },
+    );
+  }
+
+  const filtersActive = memberFilter !== "All" || Boolean(fromDate || toDate || merchantQuery) || verifyFilter !== "all" || sizeFilter !== "all" || quickFilter !== null;
+
+  function clearFilters() {
+    setMemberFilter("All");
+    setFromDate("");
+    setToDate("");
+    setDatePreset("allTime");
+    setMerchantQuery("");
+    setVerifyFilter("all");
+    setSizeFilter("all");
+    setQuickFilter(null);
+  }
+
+  function toggleQuickFilter(next: Exclude<QuickFilter, null>) {
+    setQuickFilter((f) => (f === next ? null : next));
+  }
+
+  function quickFilterKey(e: React.KeyboardEvent, next: Exclude<QuickFilter, null>) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggleQuickFilter(next);
     }
   }
 
@@ -228,8 +263,9 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
               style={{ border: "none", padding: "8px 14px" }}
               onClick={() => setMemberFilter(label)}
               type="button"
+              aria-pressed={label === memberFilter}
             >
-              {label}
+              {filterLabel(label)}
             </button>
           ))}
         </div>
@@ -304,20 +340,8 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
             <option value="over100">Over $100</option>
           </select>
         </div>
-        {(fromDate || toDate || merchantQuery || verifyFilter !== "all" || sizeFilter !== "all") && (
-          <button
-            className="secondary"
-            type="button"
-            style={{ alignSelf: "flex-end" }}
-            onClick={() => {
-              setFromDate("");
-              setToDate("");
-              setDatePreset("allTime");
-              setMerchantQuery("");
-              setVerifyFilter("all");
-              setSizeFilter("all");
-            }}
-          >
+        {filtersActive && (
+          <button className="secondary" type="button" style={{ alignSelf: "flex-end" }} onClick={clearFilters}>
             Clear filters
           </button>
         )}
@@ -351,8 +375,9 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
           tabIndex={0}
           className={`card ${quickFilter === "out" ? "card--emphasis" : ""} card--padded stat-tile`}
           style={{ cursor: "pointer" }}
-          onClick={() => setQuickFilter((f) => (f === "out" ? null : "out"))}
-          onKeyDown={(e) => e.key === "Enter" && setQuickFilter((f) => (f === "out" ? null : "out"))}
+          aria-pressed={quickFilter === "out"}
+          onClick={() => toggleQuickFilter("out")}
+          onKeyDown={(e) => quickFilterKey(e, "out")}
         >
           <span className="label">Money out, filtered</span>
           <span className="figure">{formatCents(-outCents)}</span>
@@ -362,8 +387,9 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
           tabIndex={0}
           className={`card ${quickFilter === "in" ? "card--emphasis" : ""} card--padded stat-tile`}
           style={{ cursor: "pointer" }}
-          onClick={() => setQuickFilter((f) => (f === "in" ? null : "in"))}
-          onKeyDown={(e) => e.key === "Enter" && setQuickFilter((f) => (f === "in" ? null : "in"))}
+          aria-pressed={quickFilter === "in"}
+          onClick={() => toggleQuickFilter("in")}
+          onKeyDown={(e) => quickFilterKey(e, "in")}
         >
           <span className="label">Money in</span>
           <span className="figure" style={{ color: "var(--teal)" }}>
@@ -375,13 +401,16 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
           tabIndex={0}
           className={`card ${quickFilter === "needsCategory" ? "card--emphasis" : ""} card--padded stat-tile`}
           style={{ cursor: "pointer" }}
-          onClick={() => setQuickFilter((f) => (f === "needsCategory" ? null : "needsCategory"))}
-          onKeyDown={(e) => e.key === "Enter" && setQuickFilter((f) => (f === "needsCategory" ? null : "needsCategory"))}
+          aria-pressed={quickFilter === "needsCategory"}
+          onClick={() => toggleQuickFilter("needsCategory")}
+          onKeyDown={(e) => quickFilterKey(e, "needsCategory")}
         >
           <span className="label">Needs a category</span>
           <span className="figure">{uncategorizedCount}</span>
         </div>
       </div>
+
+      <Notice notice={action.notice} onDismiss={action.clear} />
 
       {groups.map((group) => (
         <div key={group.date} className="section" style={{ gap: 12 }}>
@@ -396,32 +425,43 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
             {group.rows.map((t) => {
               const category = t.category_id ? categoryById.get(t.category_id) : null;
               const mark = VERIFY_MARK[t.verify_state];
-              const isBusy = busyId === t.id;
+              const isBusy = action.busyKey === t.id;
+              const editable = !t.is_transfer;
               return (
-                <div className={`row-item ${Boolean(t.excluded_from_budget) || Boolean(t.is_transfer) ? "row-item--excluded" : ""}`} key={t.id}>
-                  <div style={{ position: "relative", flex: "0 0 auto" }}>
+                <div
+                  className={`row-item ${Boolean(t.excluded_from_budget) || Boolean(t.is_transfer) ? "row-item--excluded" : ""} ${editable ? "row-item--clickable" : ""}`}
+                  key={t.id}
+                  onClick={(e) => {
+                    if (!editable || (e.target as HTMLElement).closest("button, input, select, a")) return;
+                    setEditingTransaction(t);
+                  }}
+                >
+                  <div style={{ position: "relative", flex: "0 0 auto" }} onClick={(e) => e.stopPropagation()}>
                     <button
                       type="button"
                       className={`flag-dot ${t.flag_color ? `flag-dot--${t.flag_color}` : ""}`}
                       title={t.flag_color ? `Flagged ${t.flag_color}` : "Flag this transaction"}
+                      aria-label={t.flag_color ? `Flagged ${t.flag_color}. Change flag` : "Flag this transaction"}
+                      aria-expanded={flagMenuId === t.id}
                       disabled={isBusy}
                       onClick={(e) => openFlagMenu(t.id, e.currentTarget)}
                     />
                     {flagMenuId === t.id && flagMenuPos && (
                       <>
                         <div style={{ position: "fixed", inset: 0, zIndex: 19 }} onClick={() => setFlagMenuId(null)} />
-                        <div className="flag-menu" style={{ top: flagMenuPos.top, left: flagMenuPos.left }}>
+                        <div className="flag-menu" style={{ top: flagMenuPos.top, left: flagMenuPos.left }} role="group" aria-label="Flag color">
                           {FLAG_COLORS.map((color) => (
                             <button
                               key={color}
                               type="button"
                               className={`flag-dot flag-dot--${color}`}
-                              title={color}
+                              title={`Flag ${color}`}
+                              aria-label={`Flag ${color}`}
                               onClick={() => setFlag(t.id, color)}
                             />
                           ))}
                           {t.flag_color && (
-                            <button type="button" className="flag-dot" title="Clear flag" onClick={() => setFlag(t.id, null)} />
+                            <button type="button" className="flag-dot" title="Remove flag" aria-label="Remove flag" onClick={() => setFlag(t.id, null)} />
                           )}
                         </div>
                       </>
@@ -435,7 +475,7 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
                   {t.is_transfer ? (
                     <span className="badge">transfer</span>
                   ) : (
-                    <span className={`category-chip ${category ? "" : "category-chip--empty"}`}>{category?.name ?? "Needs review"}</span>
+                    <span className={`category-chip ${category ? "" : "category-chip--empty"}`}>{category?.name ?? NEEDS_CATEGORY}</span>
                   )}
                   <span className={`money ${t.amount_cents < 0 ? "" : "positive"}`} style={{ minWidth: 96, textAlign: "right" }}>
                     {formatCents(t.amount_cents)}
@@ -444,7 +484,7 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
                     {mark.content}
                   </span>
                   {!t.is_transfer && (
-                    <button type="button" className="row-edit-btn" title="Edit" disabled={isBusy} onClick={() => setEditingTransaction(t)}>
+                    <button type="button" className="row-edit-btn" title="Edit" aria-label="Edit" disabled={isBusy} onClick={() => setEditingTransaction(t)}>
                       <PencilIcon size={14} />
                     </button>
                   )}
@@ -454,9 +494,16 @@ export function TransactionsPage({ householdId, currentUserId, users, accounts, 
           </div>
         </div>
       ))}
-      {filtered.length === 0 && <p className="hint">No transactions match.</p>}
-
-      {error && <p className="error">{error}</p>}
+      {filtered.length === 0 &&
+        (transactions.length === 0 ? (
+          <EmptyState title="No transactions yet" hint="Link a bank account or import a CSV from Settings, and they'll show up here." />
+        ) : (
+          <EmptyState title="Nothing matches these filters">
+            <button type="button" className="secondary" onClick={clearFilters}>
+              Clear filters
+            </button>
+          </EmptyState>
+        ))}
 
       {editingTransaction && (
         <TransactionDetailModal

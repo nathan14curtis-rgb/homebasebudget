@@ -1,35 +1,19 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import {
-  api,
-  type Account,
-  type Category,
-  type RecurringPattern,
-  type SeriesOccurrence,
-  type Tag,
-  type Transaction,
-  type TransactionFlagColor,
-} from "../api";
+import { api, type Account, type Category, type RecurringPattern, type SeriesOccurrence, type Tag, type Transaction, type TransactionFlagColor } from "../api";
 import { formatCents } from "../format";
+import { parseMoney, moneyToInput } from "../money";
+import { NEEDS_CATEGORY, VALIDATION } from "../copy";
 import { Modal } from "./ScheduleFields";
+import { MoneyInput } from "./MoneyInput";
+import { Notice, useAction } from "./Notice";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 const FLAG_COLORS: TransactionFlagColor[] = ["red", "orange", "yellow", "green", "blue", "purple"];
 
-/** Dollars ("-45.23") from cents, for the amount input. The sign is part
- * of the value: an expense is negative in this codebase, and hiding that
- * from the field would make a person's correction flip the row's meaning. */
-function centsToInput(cents: number): string {
-  return (cents / 100).toFixed(2);
-}
-
-function inputToCents(value: string): number | null {
-  const cents = Math.round(Number(value) * 100);
-  return Number.isFinite(cents) ? cents : null;
-}
-
 /**
- * The one transaction detail modal, shared by the Transactions page and
- * the Spending Plan (docs/SPENDING_PLAN_EDITING.md phase 4) — a fix to how
- * editing works lands once instead of drifting between two copies.
+ * The one transaction detail modal, shared by the Transactions page, the
+ * Spending Plan and the Bills & Income calendar — a fix to how editing
+ * works lands once instead of drifting between copies.
  *
  * Everything it shows saves in a single request (api.updateTransaction),
  * so correcting a payee, an amount, and a category is one write rather
@@ -37,10 +21,14 @@ function inputToCents(value: string): number | null {
  * because they're their own resources, and both are skipped when nothing
  * about them changed.
  *
+ * The amount is entered as a magnitude plus a direction (money out or
+ * money in) rather than a signed number: every other amount field in the
+ * app is a magnitude with a "$" in front, and "-45.23" in a box was the
+ * one place a person had to know that expenses are negative.
+ *
  * When `occurrence` is set, the transaction is standing in for a
  * projected occurrence of a recurring series, and the series card offers
- * the actions that belong to that relationship: unlink, skip, override
- * this month's amount.
+ * the actions that belong to that relationship.
  */
 export function TransactionDetailModal({
   householdId,
@@ -65,7 +53,8 @@ export function TransactionDetailModal({
 }) {
   const [payee, setPayee] = useState(transaction.normalized_merchant ?? transaction.raw_description);
   const [postedAt, setPostedAt] = useState(transaction.posted_at);
-  const [amount, setAmount] = useState(centsToInput(transaction.amount_cents));
+  const [amount, setAmount] = useState(moneyToInput(transaction.amount_cents));
+  const [direction, setDirection] = useState<"out" | "in">(transaction.amount_cents > 0 ? "in" : "out");
   const [accountId, setAccountId] = useState(transaction.account_id);
   const [categoryId, setCategoryId] = useState(transaction.category_id ?? "");
   const [memo, setMemo] = useState(transaction.memo ?? "");
@@ -81,14 +70,12 @@ export function TransactionDetailModal({
   const [splitting, setSplitting] = useState(false);
   const [splits, setSplits] = useState<Array<{ amount: string; categoryId: string }>>([]);
 
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmingUnlink, setConfirmingUnlink] = useState(false);
+  const action = useAction();
+  const saving = action.busy;
 
-  const budgetableCategories = useMemo(
-    () => categories.filter((c) => !c.archived_at && c.kind !== "transfer"),
-    [categories],
-  );
+  const budgetableCategories = useMemo(() => categories.filter((c) => !c.archived_at && c.kind !== "transfer"), [categories]);
   const account = accounts.find((a) => a.id === accountId);
 
   useEffect(() => {
@@ -132,47 +119,43 @@ export function TransactionDetailModal({
     setTagIds((prev) => (prev === null ? [tagId] : prev.includes(tagId) ? prev.filter((id) => id !== tagId) : [...prev, tagId]));
   }
 
+  /** The signed amount the form currently describes, or null when the field isn't a number. */
+  function signedAmountCents(): number | null {
+    const magnitude = parseMoney(amount);
+    if (magnitude === null) return null;
+    return direction === "in" ? magnitude : -magnitude;
+  }
+
   function startSplitting() {
     // Seeded with two halves of the current amount, which is the shape of
     // essentially every split — one line to keep, one to move.
-    const cents = inputToCents(amount) ?? transaction.amount_cents;
+    const cents = Math.abs(signedAmountCents() ?? transaction.amount_cents);
     const half = Math.trunc(cents / 2);
     setSplits([
-      { amount: centsToInput(half), categoryId: categoryId || budgetableCategories[0]?.id || "" },
-      { amount: centsToInput(cents - half), categoryId: budgetableCategories[0]?.id ?? "" },
+      { amount: moneyToInput(half), categoryId: categoryId || budgetableCategories[0]?.id || "" },
+      { amount: moneyToInput(cents - half), categoryId: budgetableCategories[0]?.id ?? "" },
     ]);
     setSplitting(true);
   }
 
-  const splitSumCents = splits.reduce((sum, s) => sum + (inputToCents(s.amount) ?? 0), 0);
-  const targetCents = inputToCents(amount) ?? transaction.amount_cents;
+  const splitSumCents = splits.reduce((sum, s) => sum + (parseMoney(s.amount) ?? 0), 0);
+  const targetCents = Math.abs(signedAmountCents() ?? transaction.amount_cents);
   const splitRemainderCents = targetCents - splitSumCents;
 
   async function save(e: FormEvent) {
     e.preventDefault();
-    const amountCents = inputToCents(amount);
-    if (amountCents === null || amountCents === 0) {
-      setError("Enter a non-zero amount");
-      return;
-    }
-    if (!payee.trim()) {
-      setError("Enter a payee");
-      return;
-    }
+    const amountCents = signedAmountCents();
+    if (amountCents === null) return action.showError(VALIDATION.amount);
+    if (amountCents === 0) return action.showError("Enter an amount other than zero.");
+    if (!payee.trim()) return action.showError("Enter who this was paid to.");
     if (splitting) {
-      if (splits.some((s) => !s.categoryId)) {
-        setError("Give every split line a category");
-        return;
-      }
-      if (splitRemainderCents !== 0) {
-        setError(`Splits must add up to ${formatCents(targetCents)} — ${formatCents(splitRemainderCents)} unaccounted for`);
-        return;
-      }
+      if (splits.some((s) => parseMoney(s.amount) === null)) return action.showError("Every split line needs an amount.");
+      if (splits.some((s) => !s.categoryId)) return action.showError("Give every split line a category.");
+      if (splitRemainderCents !== 0) return action.showError(`The splits have to add up to ${formatCents(targetCents)}. ${formatCents(Math.abs(splitRemainderCents))} is ${splitRemainderCents > 0 ? "still unassigned" : "over"}.`);
     }
 
-    setSaving(true);
-    setError(null);
-    try {
+    const sign = amountCents < 0 ? -1 : 1;
+    const ok = await action.run(async () => {
       await api.updateTransaction(householdId, transaction.id, {
         payee: payee.trim(),
         postedAt,
@@ -198,291 +181,282 @@ export function TransactionDetailModal({
         await api.splitTransaction(
           householdId,
           transaction.id,
-          splits.map((s) => ({ amountCents: inputToCents(s.amount)!, categoryId: s.categoryId })),
+          splits.map((s) => ({ amountCents: sign * (parseMoney(s.amount) ?? 0), categoryId: s.categoryId })),
         );
       }
       await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function remove() {
-    setSaving(true);
-    setError(null);
-    try {
-      await api.deleteTransaction(householdId, transaction.id);
-      await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete");
-      setSaving(false);
-    }
-  }
-
-  async function unlinkFromSeries() {
-    if (!occurrence) return;
-    setSaving(true);
-    setError(null);
-    try {
-      await api.unlinkOccurrence(householdId, occurrence.id);
-      await onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to unlink");
-      setSaving(false);
-    }
+    });
+    if (ok) onClose();
   }
 
   const createTagAndApply = async () => {
     const name = newTagName.trim();
     if (!name) return;
-    try {
+    const ok = await action.run(async () => {
       const tag = await api.createTag(householdId, { name });
       setAllTags((prev) => (prev.some((t) => t.id === tag.id) ? prev : [...prev, tag].sort((a, b) => a.name.localeCompare(b.name))));
       setTagIds((prev) => (prev?.includes(tag.id) ? prev : [...(prev ?? []), tag.id]));
-      setNewTagName("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to add tag");
-    }
+    });
+    if (ok) setNewTagName("");
   };
 
   return (
-    <Modal title="Transaction detail" onClose={onClose} width={560}>
-        <p className="hint" style={{ margin: 0 }}>
-          Appears on your {account?.name ?? "account"} statement as <strong>{transaction.raw_description}</strong>.
-        </p>
+    <Modal
+      title="Transaction"
+      onClose={onClose}
+      width={560}
+      footer={
+        <>
+          <button type="button" className="danger" disabled={saving} onClick={() => setConfirmingDelete(true)} style={{ marginRight: "auto" }}>
+            Delete
+          </button>
+          <button type="button" className="secondary" disabled={saving} onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" form="transaction-detail-form" disabled={saving}>
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </>
+      }
+    >
+      <p className="hint" style={{ margin: 0 }}>
+        Appears on your {account?.name ?? "account"} statement as <strong>{transaction.raw_description}</strong>.
+      </p>
 
-        <form className="section" style={{ gap: 12 }} onSubmit={save}>
-          <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
-            <div className="field" style={{ margin: 0, flex: "1 1 200px" }}>
-              <label htmlFor="txn-payee">Payee</label>
-              <input id="txn-payee" type="text" value={payee} onChange={(e) => setPayee(e.target.value)} disabled={saving} />
-            </div>
-            <div className="field" style={{ margin: 0 }}>
-              <label htmlFor="txn-date">Date</label>
-              <input id="txn-date" type="date" value={postedAt} onChange={(e) => setPostedAt(e.target.value)} disabled={saving} />
-            </div>
+      <form id="transaction-detail-form" className="section" style={{ gap: 12 }} onSubmit={save}>
+        <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
+          <div className="field" style={{ margin: 0, flex: "1 1 200px" }}>
+            <label htmlFor="txn-payee">Payee</label>
+            <input id="txn-payee" type="text" data-autofocus="true" value={payee} onChange={(e) => setPayee(e.target.value)} disabled={saving} />
           </div>
-
-          <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
-            <div className="field" style={{ margin: 0 }}>
-              <label htmlFor="txn-amount">Amount</label>
-              <input
-                id="txn-amount"
-                type="number"
-                step="0.01"
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                disabled={saving}
-                style={{ width: 140 }}
-              />
-            </div>
-            <div className="field" style={{ margin: 0, flex: "1 1 180px" }}>
-              <label htmlFor="txn-account">Account</label>
-              <select id="txn-account" value={accountId} onChange={(e) => setAccountId(e.target.value)} disabled={saving}>
-                {accounts.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="field" style={{ margin: 0 }}>
-              <label htmlFor="txn-status">Status</label>
-              <select id="txn-status" value={pending ? "pending" : "cleared"} onChange={(e) => setPending(e.target.value === "pending")} disabled={saving}>
-                <option value="cleared">Cleared</option>
-                <option value="pending">Pending</option>
-              </select>
-            </div>
-          </div>
-
           <div className="field" style={{ margin: 0 }}>
+            <label htmlFor="txn-date">Date</label>
+            <input id="txn-date" type="date" value={postedAt} onChange={(e) => setPostedAt(e.target.value)} disabled={saving} />
+          </div>
+        </div>
+
+        <div className="row" style={{ gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+          <div className="field" style={{ margin: 0 }}>
+            <label htmlFor="txn-amount">Amount</label>
+            <MoneyInput id="txn-amount" value={amount} onChange={setAmount} disabled={saving} width={140} />
+          </div>
+          <div className="field" style={{ margin: 0 }}>
+            <label id="txn-direction-label">Direction</label>
+            <div className="segmented" role="radiogroup" aria-labelledby="txn-direction-label">
+              <button type="button" role="radio" aria-checked={direction === "out"} className={`segmented-option ${direction === "out" ? "is-selected" : ""}`} disabled={saving} onClick={() => setDirection("out")}>
+                Money out
+              </button>
+              <button type="button" role="radio" aria-checked={direction === "in"} className={`segmented-option ${direction === "in" ? "is-selected" : ""}`} disabled={saving} onClick={() => setDirection("in")}>
+                Money in
+              </button>
+            </div>
+          </div>
+          <div className="field" style={{ margin: 0 }}>
+            <label htmlFor="txn-status">Status</label>
+            <select id="txn-status" value={pending ? "pending" : "cleared"} onChange={(e) => setPending(e.target.value === "pending")} disabled={saving}>
+              <option value="cleared">Cleared</option>
+              <option value="pending">Pending</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
+          <div className="field" style={{ margin: 0, flex: "1 1 180px" }}>
+            <label htmlFor="txn-account">Account</label>
+            <select id="txn-account" value={accountId} onChange={(e) => setAccountId(e.target.value)} disabled={saving}>
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field" style={{ margin: 0, flex: "1 1 180px" }}>
             <label htmlFor="txn-category">Category</label>
             <select id="txn-category" value={categoryId} onChange={(e) => setCategoryId(e.target.value)} disabled={saving || splitting}>
-              <option value="">Needs review</option>
+              <option value="">{NEEDS_CATEGORY}</option>
               {budgetableCategories.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
                 </option>
               ))}
             </select>
-            {splitting && <p className="hint" style={{ margin: "4px 0 0" }}>Split lines carry their own categories.</p>}
           </div>
+        </div>
+        {splitting && <p className="hint" style={{ margin: "-6px 0 0" }}>Split lines carry their own categories.</p>}
 
-          {allTags.length > 0 || tagIds !== null ? (
-            <div className="field" style={{ margin: 0 }}>
-              <label>Tags</label>
-              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
-                {allTags.map((tag) => {
-                  const on = tagIds?.includes(tag.id) ?? false;
-                  return (
-                    <button
-                      key={tag.id}
-                      type="button"
-                      className={`badge ${on ? "" : "badge--muted"}`}
-                      style={{ cursor: "pointer", border: "none" }}
-                      disabled={saving}
-                      onClick={() => toggleTag(tag.id)}
-                    >
-                      {tag.name}
-                    </button>
-                  );
-                })}
-                <input
-                  type="text"
-                  placeholder="New tag"
-                  value={newTagName}
-                  disabled={saving}
-                  onChange={(e) => setNewTagName(e.target.value)}
-                  onKeyDown={(e) => {
-                    // Enter inside a form would submit the whole modal.
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void createTagAndApply();
-                    }
-                  }}
-                  style={{ width: 120 }}
-                />
-              </div>
-            </div>
-          ) : null}
-
-          {splitting ? (
-            <div className="section" style={{ gap: 8 }}>
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <label>Split</label>
-                <button type="button" className="secondary" disabled={saving} onClick={() => setSplitting(false)}>
-                  Cancel split
-                </button>
-              </div>
-              {splits.map((split, i) => (
-                <div className="row" style={{ gap: 8 }} key={i}>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={split.amount}
-                    disabled={saving}
-                    onChange={(e) => setSplits((prev) => prev.map((s, j) => (i === j ? { ...s, amount: e.target.value } : s)))}
-                    style={{ width: 120 }}
-                  />
-                  <select
-                    value={split.categoryId}
-                    disabled={saving}
-                    onChange={(e) => setSplits((prev) => prev.map((s, j) => (i === j ? { ...s, categoryId: e.target.value } : s)))}
-                    style={{ flex: 1 }}
-                  >
-                    <option value="">Pick a category</option>
-                    {budgetableCategories.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
-                  {splits.length > 2 && (
-                    <button type="button" className="row-edit-btn" title="Remove line" disabled={saving} onClick={() => setSplits((prev) => prev.filter((_, j) => j !== i))}>
-                      ×
-                    </button>
-                  )}
-                </div>
-              ))}
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <button
-                  type="button"
-                  className="secondary"
-                  disabled={saving}
-                  onClick={() => setSplits((prev) => [...prev, { amount: centsToInput(splitRemainderCents), categoryId: "" }])}
-                >
-                  Add line
-                </button>
-                <span className={`money ${splitRemainderCents === 0 ? "positive" : "negative"}`}>
-                  {splitRemainderCents === 0 ? "Balanced" : `${formatCents(splitRemainderCents)} left`}
-                </span>
-              </div>
-            </div>
-          ) : (
-            <button type="button" className="secondary" style={{ alignSelf: "flex-start" }} disabled={saving} onClick={startSplitting}>
-              Split this transaction
-            </button>
-          )}
-
-          {occurrence && pattern && (
-            <div className="card card--padded" style={{ gap: 8, display: "flex", flexDirection: "column" }}>
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <div>
-                  <span className="row-title">Linked to series</span>
-                  <p className="hint" style={{ margin: 0 }}>
-                    {pattern.merchant_pattern} · due {occurrence.due_date}
-                  </p>
-                </div>
-                <button type="button" className="secondary" disabled={saving} onClick={unlinkFromSeries}>
-                  Unlink
-                </button>
-              </div>
-            </div>
-          )}
-
+        {allTags.length > 0 || tagIds !== null ? (
           <div className="field" style={{ margin: 0 }}>
-            <label htmlFor="txn-note">Note</label>
-            <input id="txn-note" type="text" placeholder="Add your note here" value={memo} disabled={saving} onChange={(e) => setMemo(e.target.value)} />
+            <label htmlFor="txn-new-tag">Tags</label>
+            <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+              {allTags.map((tag) => {
+                const on = tagIds?.includes(tag.id) ?? false;
+                return (
+                  <button
+                    key={tag.id}
+                    type="button"
+                    className={`badge badge--soft ${on ? "" : "badge--muted"}`}
+                    aria-pressed={on}
+                    style={{ cursor: "pointer", border: "none" }}
+                    disabled={saving}
+                    onClick={() => toggleTag(tag.id)}
+                  >
+                    {tag.name}
+                  </button>
+                );
+              })}
+              <input
+                id="txn-new-tag"
+                type="text"
+                placeholder="New tag, then Enter"
+                value={newTagName}
+                disabled={saving}
+                onChange={(e) => setNewTagName(e.target.value)}
+                onKeyDown={(e) => {
+                  // Enter inside a form would submit the whole modal.
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void createTagAndApply();
+                  }
+                }}
+                style={{ width: 150 }}
+              />
+            </div>
           </div>
+        ) : null}
 
-          <div className="row" style={{ gap: 16, flexWrap: "wrap" }}>
-            <label className="row" style={{ gap: 6, fontSize: 13 }}>
-              <input type="checkbox" checked={excluded} disabled={saving} onChange={(e) => setExcluded(e.target.checked)} />
-              Exclude from Spending Plan
-            </label>
-            <label className="row" style={{ gap: 6, fontSize: 13 }}>
-              <input type="checkbox" checked={reviewed} disabled={saving} onChange={(e) => setReviewed(e.target.checked)} />
-              Reviewed
-            </label>
-            <div className="row" style={{ gap: 4 }}>
-              {FLAG_COLORS.map((color) => (
-                <button
-                  key={color}
-                  type="button"
-                  className={`flag-dot flag-dot--${color}`}
-                  title={`Flag ${color}`}
+        {splitting ? (
+          <div className="section" style={{ gap: 8 }}>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <label>Split across categories</label>
+              <button type="button" className="secondary" disabled={saving} onClick={() => setSplitting(false)}>
+                Don't split
+              </button>
+            </div>
+            {splits.map((split, i) => (
+              <div className="row" style={{ gap: 8 }} key={i}>
+                <MoneyInput
+                  ariaLabel={`Split line ${i + 1} amount`}
+                  value={split.amount}
                   disabled={saving}
-                  style={flagColor === color ? { outline: "2px solid var(--ink)", outlineOffset: 2 } : undefined}
-                  onClick={() => setFlagColor(color)}
+                  onChange={(value) => setSplits((prev) => prev.map((s, j) => (i === j ? { ...s, amount: value } : s)))}
+                  width={130}
                 />
-              ))}
-              <button type="button" className="flag-dot" title="Clear flag" disabled={saving} onClick={() => setFlagColor(null)} />
-            </div>
-          </div>
-
-          {error && <p className="error" style={{ margin: 0 }}>{error}</p>}
-
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            {confirmingDelete ? (
-              <div className="row" style={{ gap: 8 }}>
-                <span className="hint">Delete for good?</span>
-                <button type="button" className="danger" disabled={saving} onClick={remove}>
-                  Delete
-                </button>
-                <button type="button" className="secondary" disabled={saving} onClick={() => setConfirmingDelete(false)}>
-                  Keep
-                </button>
+                <select
+                  aria-label={`Split line ${i + 1} category`}
+                  value={split.categoryId}
+                  disabled={saving}
+                  onChange={(e) => setSplits((prev) => prev.map((s, j) => (i === j ? { ...s, categoryId: e.target.value } : s)))}
+                  style={{ flex: 1 }}
+                >
+                  <option value="">Pick a category</option>
+                  {budgetableCategories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+                {splits.length > 2 && (
+                  <button type="button" className="row-edit-btn" aria-label="Remove this line" title="Remove this line" disabled={saving} onClick={() => setSplits((prev) => prev.filter((_, j) => j !== i))}>
+                    ×
+                  </button>
+                )}
               </div>
-            ) : (
-              <button type="button" className="danger" disabled={saving} onClick={() => setConfirmingDelete(true)}>
-                Delete transaction
+            ))}
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <button type="button" className="secondary" disabled={saving} onClick={() => setSplits((prev) => [...prev, { amount: moneyToInput(Math.max(0, splitRemainderCents)), categoryId: "" }])}>
+                Add line
               </button>
-            )}
-            <div className="row" style={{ gap: 8 }}>
-              <button type="button" className="secondary" disabled={saving} onClick={onClose}>
-                Cancel
-              </button>
-              <button type="submit" disabled={saving}>
-                {saving ? "Saving…" : "Update"}
+              <span className={`money ${splitRemainderCents === 0 ? "positive" : "negative"}`}>
+                {splitRemainderCents === 0 ? "Adds up" : splitRemainderCents > 0 ? `${formatCents(splitRemainderCents)} still to assign` : `${formatCents(-splitRemainderCents)} over`}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <button type="button" className="secondary" style={{ alignSelf: "flex-start" }} disabled={saving} onClick={startSplitting}>
+            Split across categories
+          </button>
+        )}
+
+        {occurrence && pattern && (
+          <div className="card card--padded" style={{ gap: 8, display: "flex", flexDirection: "column", marginBottom: 0 }}>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <div>
+                <span className="row-title">Linked to a series</span>
+                <p className="hint" style={{ margin: 0 }}>
+                  {pattern.merchant_pattern} · due {occurrence.due_date}
+                </p>
+              </div>
+              <button type="button" className="secondary" disabled={saving} onClick={() => setConfirmingUnlink(true)}>
+                Unlink
               </button>
             </div>
           </div>
-        </form>
+        )}
+
+        <div className="field" style={{ margin: 0 }}>
+          <label htmlFor="txn-note">Note</label>
+          <input id="txn-note" type="text" placeholder="Anything worth remembering about this one" value={memo} disabled={saving} onChange={(e) => setMemo(e.target.value)} />
+        </div>
+
+        <div className="row" style={{ gap: 16, flexWrap: "wrap" }}>
+          <label className="row" style={{ gap: 6, fontSize: 13 }}>
+            <input type="checkbox" checked={excluded} disabled={saving} onChange={(e) => setExcluded(e.target.checked)} />
+            Leave out of the Spending Plan
+          </label>
+          <label className="row" style={{ gap: 6, fontSize: 13 }}>
+            <input type="checkbox" checked={reviewed} disabled={saving} onChange={(e) => setReviewed(e.target.checked)} />
+            Reviewed
+          </label>
+          <div className="row" style={{ gap: 4 }} role="group" aria-label="Flag">
+            {FLAG_COLORS.map((color) => (
+              <button
+                key={color}
+                type="button"
+                className={`flag-dot flag-dot--${color}`}
+                aria-label={`Flag ${color}`}
+                aria-pressed={flagColor === color}
+                title={`Flag ${color}`}
+                disabled={saving}
+                style={flagColor === color ? { outline: "2px solid var(--ink)", outlineOffset: 2 } : undefined}
+                onClick={() => setFlagColor(color)}
+              />
+            ))}
+            <button type="button" className="flag-dot" aria-label="No flag" title="No flag" disabled={saving} onClick={() => setFlagColor(null)} />
+          </div>
+        </div>
+
+        <Notice notice={action.notice} onDismiss={action.clear} />
+      </form>
+
+      {confirmingDelete && (
+        <ConfirmDialog
+          title="Delete this transaction?"
+          body="It's gone for good, from every page and every total. If it came from your bank, the next sync won't bring it back."
+          confirmLabel="Delete"
+          onCancel={() => setConfirmingDelete(false)}
+          onConfirm={async () => {
+            await api.deleteTransaction(householdId, transaction.id);
+            await onSaved();
+            onClose();
+          }}
+        />
+      )}
+
+      {confirmingUnlink && occurrence && (
+        <ConfirmDialog
+          title="Unlink from the series?"
+          body="The calendar goes back to expecting this bill, and the transaction stays where it is as an ordinary charge."
+          confirmLabel="Unlink"
+          danger={false}
+          onCancel={() => setConfirmingUnlink(false)}
+          onConfirm={async () => {
+            await api.unlinkOccurrence(householdId, occurrence.id);
+            await onSaved();
+            onClose();
+          }}
+        />
+      )}
     </Modal>
   );
 }

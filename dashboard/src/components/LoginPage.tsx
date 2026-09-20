@@ -1,19 +1,11 @@
 import { useState, type FormEvent } from "react";
-import { api } from "../api";
+import { api, errorMessage } from "../api";
+import { formatUsPhoneDisplay, usPhoneToE164 } from "../copy";
+import { Notice } from "./Notice";
 
 interface Props {
   onLoggedIn: () => void;
   onCreateHouseholdInstead: () => void;
-}
-
-/** Formats digits as a US number for display: "303", "(303) 555", "(303)
- * 555-1234". Caps at 10 digits — a leading "1" is dropped since it's added
- * back automatically at submit time. */
-function formatUsPhoneDisplay(digits: string): string {
-  const d = digits.replace(/^1/, "").slice(0, 10);
-  if (d.length <= 3) return d;
-  if (d.length <= 6) return `(${d.slice(0, 3)}) ${d.slice(3)}`;
-  return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
 }
 
 export function LoginPage({ onLoggedIn, onCreateHouseholdInstead }: Props) {
@@ -28,17 +20,18 @@ export function LoginPage({ onLoggedIn, onCreateHouseholdInstead }: Props) {
   // (src/routes/sendblueWebhook.ts) — so format it for display and submit
   // it as E.164 (+1XXXXXXXXXX) without making anyone type the "+1" or
   // punctuation themselves.
-  const phoneE164 = `+1${phoneDigits.replace(/^1/, "").slice(0, 10)}`;
+  const phoneE164 = usPhoneToE164(phoneDigits);
 
   async function sendCode(e: FormEvent) {
     e.preventDefault();
+    if (!phoneE164) return setError("Enter a 10-digit US phone number.");
     setError(null);
     setBusy(true);
     try {
       await api.requestLoginCode(phoneE164);
       setStep("code");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't send a code — check the number and try again.");
+      setError(errorMessage(err, "Couldn't send a code. Check the number and try again."));
     } finally {
       setBusy(false);
     }
@@ -46,13 +39,15 @@ export function LoginPage({ onLoggedIn, onCreateHouseholdInstead }: Props) {
 
   async function verify(e: FormEvent) {
     e.preventDefault();
+    if (!phoneE164) return setStep("phone");
+    if (!code.trim()) return setError("Enter the 6-digit code from the text.");
     setError(null);
     setBusy(true);
     try {
       await api.verifyLoginCode(phoneE164, code.trim());
       onLoggedIn();
-    } catch {
-      setError("That code is invalid or has expired.");
+    } catch (err) {
+      setError(errorMessage(err, "That code is invalid or has expired."));
     } finally {
       setBusy(false);
     }
@@ -78,15 +73,15 @@ export function LoginPage({ onLoggedIn, onCreateHouseholdInstead }: Props) {
               required
             />
           </div>
-          <button type="submit" disabled={busy || phoneDigits.replace(/^1/, "").length !== 10}>
-            Text me a code
+          <button type="submit" disabled={busy || !phoneE164}>
+            {busy ? "Sending…" : "Text me a code"}
           </button>
-          {error && <p className="error">{error}</p>}
+          <Notice notice={error ? { kind: "error", text: error } : null} onDismiss={() => setError(null)} style={{ marginTop: 12 }} />
           <p className="hint">
             Only a number already verified for a household member will receive a code. New here?{" "}
-            <a href="#" onClick={(e) => (e.preventDefault(), onCreateHouseholdInstead())}>
+            <button type="button" className="link-button" onClick={onCreateHouseholdInstead}>
               Create a household
-            </a>
+            </button>
             .
           </p>
         </form>
@@ -108,12 +103,12 @@ export function LoginPage({ onLoggedIn, onCreateHouseholdInstead }: Props) {
             />
           </div>
           <button type="submit" disabled={busy}>
-            Log in
+            {busy ? "Checking…" : "Log in"}
           </button>
           <button type="button" className="secondary" onClick={() => setStep("phone")}>
             Use a different number
           </button>
-          {error && <p className="error">{error}</p>}
+          <Notice notice={error ? { kind: "error", text: error } : null} onDismiss={() => setError(null)} style={{ marginTop: 12 }} />
         </form>
       )}
     </div>

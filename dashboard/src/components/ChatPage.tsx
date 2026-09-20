@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { api, type ChatMessage } from "../api";
+import { api, errorMessage, type ChatMessage } from "../api";
+import { Notice } from "./Notice";
 
 /**
  * The budgeting bot, in the browser. Not a second assistant: this posts to
@@ -38,7 +39,7 @@ export function ChatPage({ householdId, currentUserId, onChanged }: Props) {
     api
       .getChat(householdId)
       .then((result) => setMessages(result.messages))
-      .catch(() => setError("Couldn't load the conversation."));
+      .catch((err) => setError(errorMessage(err, "Couldn't load the conversation.")));
   }, [householdId]);
 
   useEffect(() => {
@@ -70,8 +71,10 @@ export function ChatPage({ householdId, currentUserId, onChanged }: Props) {
           { id: `local_reply_${Date.now()}`, role: "assistant", content: reply, channel: "dashboard", createdAt: new Date().toISOString() },
         ]);
         if (changed) onChanged();
-      } catch {
-        setError("That didn't go through — try again.");
+      } catch (err) {
+        setError(errorMessage(err, "That didn't go through. Try again."));
+        setDraft(trimmed);
+        setMessages((prev) => prev.filter((m) => m.id !== pending.id));
       } finally {
         setSending(false);
       }
@@ -126,7 +129,7 @@ export function ChatPage({ householdId, currentUserId, onChanged }: Props) {
           Send
         </button>
       </form>
-      {error && <p className="error">{error}</p>}
+      <Notice notice={error ? { kind: "error", text: error } : null} onDismiss={() => setError(null)} />
     </section>
   );
 }
