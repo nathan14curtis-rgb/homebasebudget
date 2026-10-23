@@ -49,6 +49,7 @@ import { PLAN_TOOLS } from "./planTools";
 import { SERIES_TOOLS } from "./seriesTools";
 import { TRANSACTION_TOOLS } from "./transactionTools";
 import { UNDO_TOOLS } from "./undoTools";
+import { SHEET_TOOLS } from "./sheetTools";
 
 /**
  * The tools the conversational bot (src/messaging/agent.ts) can call.
@@ -458,7 +459,7 @@ const updateSpendingPlan: AgentTool = {
         category: { type: "string", description: "The envelope's category, by name or id." },
         monthly_target_dollars: { type: "number", description: "What they plan to put toward this every month." },
         clear_monthly_target: { type: "boolean", description: "True to remove the monthly target entirely." },
-        group: { type: "string", description: "The group it's shown under on the dashboard, e.g. 'Bills', 'Everyday', 'Goals'." },
+        group: { type: "string", description: "The group it's shown under on the sheet's Budget tab, e.g. 'Bills', 'Everyday', 'Goals'." },
         goal_date: { type: "string", description: "'YYYY-MM-DD' the goal should be funded by." },
         clear_goal_date: { type: "boolean", description: "True to drop the goal date, leaving a plain envelope." },
         rollover: {
@@ -514,7 +515,7 @@ const createCategoryTool: AgentTool = {
       properties: {
         name: { type: "string" },
         kind: { type: "string", enum: ["expense", "savings", "income"], description: "savings for goals and sinking funds, income for paychecks." },
-        group: { type: "string", description: "Dashboard group, e.g. 'Bills', 'Everyday', 'Goals'." },
+        group: { type: "string", description: "Group on the sheet's Budget tab, e.g. 'Bills', 'Everyday', 'Goals'." },
         monthly_target_dollars: { type: "number" },
         goal_date: { type: "string", description: "'YYYY-MM-DD', for a savings goal with a deadline." },
         rollover: {
@@ -801,7 +802,7 @@ const CORE_TOOLS: AgentTool[] = [
   rememberMerchant,
 ];
 
-const TOOLS: AgentTool[] = [...CORE_TOOLS, ...PLAN_TOOLS, ...SERIES_TOOLS, ...TRANSACTION_TOOLS, ...UNDO_TOOLS];
+const TOOLS: AgentTool[] = [...CORE_TOOLS, ...PLAN_TOOLS, ...SERIES_TOOLS, ...TRANSACTION_TOOLS, ...UNDO_TOOLS, ...SHEET_TOOLS];
 
 const TOOLS_BY_NAME = new Map(TOOLS.map((t) => [t.definition.name, t]));
 
@@ -861,7 +862,7 @@ export async function runAgentTool(env: Env, ctx: AgentToolContext, name: string
     try {
       const entry = await recordChange(env.DB, ctx.householdId, {
         userId: ctx.userId,
-        toolName: name,
+        toolName: ctx.via === "sheet" ? `sheet:${name}` : name,
         summary: change.summary,
         undo: change.undo,
       });

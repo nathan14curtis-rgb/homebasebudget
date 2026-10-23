@@ -1,5 +1,6 @@
 import { listTags, listTagsForTransaction, setTransactionTags } from "../db/tags";
-import { getTransaction, splitTransaction, updateTransaction } from "../db/transactions";
+import { listAccounts } from "../db/accounts";
+import { applyCategorization, createTransaction, getTransaction, splitTransaction, updateTransaction } from "../db/transactions";
 import type { Transaction, TransactionFlagColor } from "../types";
 import {
   AgentToolError,
@@ -218,6 +219,68 @@ const tagTransactionTool: AgentTool = {
   },
 };
 
+const addTransactionTool: AgentTool = {
+  mutates: true,
+  access: "categorize",
+  definition: {
+    name: "add_transaction",
+    description:
+      "Record a charge the bank won't send — cash, a Venmo the bank shows as one lump, something from an account that isn't linked. Use only when the person says it happened; for a charge that's already on the books, update_transaction is the tool.",
+    input_schema: {
+      type: "object",
+      properties: {
+        account: { type: "string", description: "Account name or id it came out of (or went into)." },
+        date: { type: "string", description: "'YYYY-MM-DD'." },
+        payee: { type: "string" },
+        amount_dollars: { type: "number", description: "Negative for money out, positive for money in." },
+        category: { type: "string", description: "Category name or id, if they said." },
+        memo: { type: "string" },
+      },
+      required: ["account", "date", "payee", "amount_dollars"],
+    },
+  },
+  async run(env, ctx, input) {
+    const accountArg = required(input, "account");
+    const accounts = (await listAccounts(env.DB, ctx.householdId)).filter((a) => a.status !== "removed");
+    const needle = accountArg.toLowerCase();
+    const matches = accounts.filter((a) => a.id === accountArg || a.name.toLowerCase() === needle);
+    const partial = matches.length > 0 ? matches : accounts.filter((a) => a.name.toLowerCase().includes(needle));
+    if (partial.length !== 1) {
+      throw new AgentToolError(
+        `${partial.length === 0 ? `No account named '${accountArg}'` : `'${accountArg}' matches more than one account`}. Accounts: ${accounts.map((a) => a.name).join(", ") || "(none linked)"}.`,
+      );
+    }
+    const account = partial[0]!;
+    const date = dateArg(input, "date");
+    if (!date) throw new AgentToolError("'date' is required");
+    const amount = num(input, "amount_dollars");
+    if (amount === null || amount === 0) throw new AgentToolError("'amount_dollars' must be a non-zero number");
+    const payee = required(input, "payee");
+    const categoryName = str(input, "category");
+    const category = categoryName ? await resolveCategory(env, ctx.householdId, categoryName) : null;
+
+    const created = await createTransaction(env.DB, ctx.householdId, {
+      accountId: account.id,
+      postedAt: date,
+      amountCents: toCents(amount),
+      rawDescription: payee,
+      normalizedMerchant: payee,
+      source: "manual",
+    });
+    const memo = str(input, "memo");
+    if (category) {
+      await applyCategorization(env.DB, ctx.householdId, created.id, { categoryId: category.id, memo, method: "human", createdByUserId: ctx.userId });
+    } else if (memo) {
+      await updateTransaction(env.DB, ctx.householdId, created.id, { memo });
+    }
+    ctx.record({
+      summary: `added ${formatDollars(created.amount_cents)} at ${payee} on ${date}${category ? ` under ${category.name}` : ""}`,
+      undo: { kind: "transaction_created", transactionId: created.id },
+    });
+    return { transaction_id: created.id, account: account.name, date, payee, amount_dollars: toDollars(created.amount_cents), category: category?.name ?? null };
+  },
+};
+
 const listTagsTool: AgentTool = {
   mutates: false,
   access: "read",
@@ -232,4 +295,4 @@ const listTagsTool: AgentTool = {
   },
 };
 
-export const TRANSACTION_TOOLS: AgentTool[] = [editTransactionTool, splitTransactionTool, tagTransactionTool, listTagsTool];
+export const TRANSACTION_TOOLS: AgentTool[] = [editTransactionTool, splitTransactionTool, tagTransactionTool, addTransactionTool, listTagsTool];

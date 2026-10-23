@@ -117,7 +117,7 @@ export async function sendHourlyCheckin(env: Env, householdId: string, requeue: 
   const text = [
     header,
     ...lines,
-    ...(remaining > 0 ? [`(plus ${remaining} more waiting in the dashboard)`] : []),
+    ...(remaining > 0 ? [`(plus ${remaining} more waiting in the sheet — Status says Needs category)`] : []),
     "",
     "Just tell me what they were — plain English is fine.",
   ].join("\n");

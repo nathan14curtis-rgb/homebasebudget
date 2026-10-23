@@ -7,7 +7,6 @@
   "scripts": {
     "postinstall": "wrangler types || true",
     "dev": "wrangler dev",
-    "build:dashboard": "npm --prefix dashboard install && npm --prefix dashboard run build",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

@@ -363,7 +363,6 @@ export interface Env {
   DB: D1Database;
   TRANSACTION_QUEUE: Queue;
   MESSAGE_QUEUE: Queue;
-  ASSETS: Fetcher; // dashboard/dist, served by the platform — unused directly in Worker code
   ENVIRONMENT: string;
 
   // Workers Secrets (wrangler secret put <NAME>) — see README for the
@@ -379,6 +378,9 @@ export interface Env {
   SENDBLUE_FROM_NUMBER?: string; // the Sendblue-assigned number to send from — required by their API
   SENDBLUE_API_BASE_URL?: string; // default https://api.sendblue.com/api
   ANTHROPIC_API_KEY?: string;
+  // The key file of the Google service account the budget sheet is shared
+  // with (src/sheets/googleAuth.ts), pasted whole as JSON.
+  GOOGLE_SERVICE_ACCOUNT_JSON?: string;
 }
 
 /** One write an agent turn made, with a before-image good enough to undo

@@ -28,6 +28,9 @@ import { handleQueueBatch } from "./queue/consumer";
 import { enqueueDailyDigest } from "./messaging/dailyDigest";
 import { enqueueHourlyCheckin } from "./messaging/hourlyCheckin";
 import { enqueueHourlyPlaidSync } from "./plaid/reconciliation";
+import { enqueueSheetSyncs } from "./sheets/schedule";
+import { sheetRoute } from "./routes/sheet";
+import { BANKS_PAGE_HTML } from "./routes/banksPage";
 import type { MessageQueueMessage, TransactionQueueMessage } from "./lib/queueMessages";
 
 // Both must match wrangler.jsonc's triggers.crons exactly — ScheduledController
@@ -35,6 +38,7 @@ import type { MessageQueueMessage, TransactionQueueMessage } from "./lib/queueMe
 // only way to tell the two schedules apart.
 const DAILY_DIGEST_CRON = "0 13 * * *";
 const HOURLY_SYNC_CRON = "0 * * * *";
+const SHEET_SYNC_CRON = "*/5 * * * *";
 
 // strict: false so "/webhooks/sendblue/" matches the same route as
 // "/webhooks/sendblue". A trailing slash used to fall through to Hono's
@@ -50,6 +54,12 @@ app.onError((err, c) => {
 });
 
 app.get("/health", (c) => c.json({ ok: true, environment: c.env.ENVIRONMENT }));
+
+// There's no web dashboard any more: the household's budget lives in its
+// Google Sheet (src/sheets/) and the texting bot. The one page left is for
+// linking banks, which Plaid only allows in a browser (src/routes/banksPage.ts).
+app.get("/", (c) => c.redirect("/banks"));
+app.get("/banks", (c) => c.html(BANKS_PAGE_HTML));
 
 app.route("/api/auth", authRoute);
 app.route("/api/households", householdsRoute);
@@ -80,6 +90,7 @@ scoped.route("/:householdId/recurring-patterns", recurringPatternsRoute);
 scoped.route("/:householdId/occurrences", occurrencesRoute);
 scoped.route("/:householdId/tags", tagsRoute);
 scoped.route("/:householdId/budget", budgetRoute);
+scoped.route("/:householdId/sheet", sheetRoute);
 scoped.route("/:householdId/messaging", messagingDiagnosticsRoute);
 // The same conversational agent the iMessage loop uses, from the dashboard.
 scoped.route("/:householdId/chat", chatRoute);
@@ -108,10 +119,18 @@ export default {
 
   queue: handleQueueBatch,
 
-  // Two cron schedules, both set in wrangler.jsonc — branch on which one
+  // Three cron schedules, all set in wrangler.jsonc — branch on which one
   // fired rather than one handler per schedule, since ScheduledController
   // only carries the cron expression, not a name.
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    if (controller.cron === SHEET_SYNC_CRON) {
+      // The Google Sheet: apply what people typed, then refresh it
+      // (src/sheets/sync.ts). Every five minutes is the "a few minutes is
+      // fine" the household asked for, without hammering Google's quota.
+      const count = await enqueueSheetSyncs(env);
+      if (count > 0) console.log(`sheet sync: enqueued for ${count} household(s)`);
+      return;
+    }
     if (controller.cron === DAILY_DIGEST_CRON) {
       const count = await enqueueDailyDigest(env);
       console.log(`daily digest: enqueued for ${count} household(s)`);

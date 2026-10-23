@@ -88,7 +88,7 @@ const undoChange: AgentTool = {
     // ledger gets confusing.
     const reversal = await recordChange(env.DB, ctx.householdId, {
       userId: ctx.userId,
-      toolName: "undo_change",
+      toolName: ctx.via === "sheet" ? "sheet:undo_change" : "undo_change",
       summary: `undid: ${change.summary}`,
       undo: { kind: "none", reason: "this row is itself an undo" },
     });

@@ -59,6 +59,10 @@ export interface AgentToolContext {
   /** What that person is allowed to do. Defaults to 'full' when a caller
    * has no user to attribute (scheduled jobs act as the household). */
   accessLevel?: AccessLevel;
+  /** Where the request came from when it wasn't a conversation turn. A
+   * sheet edit (src/sheets/) runs the same tools as a text; marking it
+   * lets the change log say "Sheet" instead of "Bot". */
+  via?: "sheet";
 }
 
 /** A write, described the way the person would recognize it, plus how to

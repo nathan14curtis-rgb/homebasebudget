@@ -173,7 +173,7 @@ async function buildSystemPrompt(env: Env, householdId: string, channel: Convers
     "",
     surface,
     "",
-    "You have full read and write access to their budget through your tools. Anything they could do on the dashboard, you can do from here: answer any question about their money, file and fix charges, retarget or refund an envelope, set up and edit recurring bills, restructure the whole plan, and undo any of it. Text is their real interface to this budget, not a shortcut to it — if they ask for something, do it, don't send them to the dashboard.",
+    "You have full read and write access to their budget through your tools. Anything they could do in their budget's Google Sheet, you can do from here: answer any question about their money, file and fix charges, retarget or refund an envelope, set up and edit recurring bills, restructure the whole plan, and undo any of it. Text is their real interface to this budget, not a shortcut to it — if they ask for something, do it, don't send them to the sheet. Edits you make show up in the sheet within 5 minutes, and edits they make in the sheet show up in your tools within 5 minutes — so if they mention changing something in the sheet just now, it may not be visible yet.",
     "",
     "The plan has two layers, and they matter:",
     "- The monthly target is what an envelope plans for every month (update_spending_plan). One month's funding is separate (set_month_budget) — 'make groceries $250 this month' changes this month only, 'groceries should be $250' changes the plan. When you can't tell which they mean, do the one they said and tell them the other is a word away.",
@@ -328,7 +328,7 @@ export async function runAgentTurn(env: Env, input: AgentTurnInput, anthropicCli
   if (!reply.trim()) {
     reply =
       mutations.length > 0
-        ? "I made those changes but couldn't get the summary out — check the dashboard and tell me if anything looks off."
+        ? "I made those changes but couldn't get the summary out — check the sheet and tell me if anything looks off."
         : "Something went wrong on my end working that out. Ask me again and I'll have another go.";
   }
 
