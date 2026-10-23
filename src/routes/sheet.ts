@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { requireParam } from "../lib/http";
-import { getSheetLink, upsertSheetLink } from "../db/sheetLinks";
+import { getSheetLink, SheetAlreadyLinkedError, upsertSheetLink } from "../db/sheetLinks";
 import { parseSpreadsheetId } from "../sheets/client";
 import { serviceAccountEmail } from "../sheets/googleAuth";
 import type { Env } from "../types";
@@ -29,7 +29,12 @@ sheetRoute.post("/", async (c) => {
   const body = await c.req.json<{ url?: string }>().catch(() => ({}) as { url?: string });
   const spreadsheetId = body.url ? parseSpreadsheetId(body.url) : null;
   if (!spreadsheetId) return c.json({ error: "url must be a Google Sheets link" }, 400);
-  await upsertSheetLink(c.env.DB, householdId, spreadsheetId);
+  try {
+    await upsertSheetLink(c.env.DB, householdId, spreadsheetId);
+  } catch (err) {
+    if (err instanceof SheetAlreadyLinkedError) return c.json({ error: err.message }, 409);
+    throw err;
+  }
   await c.env.TRANSACTION_QUEUE.send({ type: "sheet_sync", householdId });
   return c.json({ connected: spreadsheetId, shareWith: serviceAccountEmail(c.env.GOOGLE_SERVICE_ACCOUNT_JSON) }, 201);
 });

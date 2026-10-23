@@ -62,7 +62,8 @@ export interface SyncResult {
 export async function syncHouseholdSheet(env: Env, householdId: string, api?: SheetsApi): Promise<SyncResult> {
   const link = await getSheetLink(env.DB, householdId);
   if (!link) return { status: "not_linked", applied: 0, failed: 0 };
-  if (!(await acquireSheetLock(env.DB, householdId))) return { status: "locked", applied: 0, failed: 0 };
+  const lock = await acquireSheetLock(env.DB, householdId);
+  if (!lock) return { status: "locked", applied: 0, failed: 0 };
   const sheets = api ?? new GoogleSheetsApi(link.spreadsheet_id, env.GOOGLE_SERVICE_ACCOUNT_JSON);
   try {
     const result = await runSync(env, link, sheets);
@@ -73,7 +74,7 @@ export async function syncHouseholdSheet(env: Env, householdId: string, api?: Sh
     await updateSheetLink(env.DB, householdId, { lastError: message.slice(0, 1000) });
     throw err;
   } finally {
-    await releaseSheetLock(env.DB, householdId);
+    await releaseSheetLock(env.DB, householdId, lock);
   }
 }
 
@@ -101,7 +102,11 @@ async function runSync(env: Env, link: SheetLink, api: SheetsApi): Promise<SyncR
   let applied = 0;
   let failed = 0;
   const errorsByTab = new Map<string, TabErrors>();
-  const createsByTab = new Map<string, number>();
+  // Each tab's snapshot as of the end of its apply step: the old snapshot
+  // with every row this pass handled set to what the sheet showed. Saved
+  // straight away, so a pass that dies later (a Google 429 on the write)
+  // and is retried can't apply the same edit a second time.
+  const progressByTab = new Map<string, TabSnapshot>();
   const now = Date.now();
   for (const spec of TABS) {
     const previous = stored.get(spec.name);
@@ -131,13 +136,20 @@ async function runSync(env: Env, link: SheetLink, api: SheetsApi): Promise<SyncR
       }
     }
 
-    for (const row of dataRows(spec, grid)) {
+    const progress: TabSnapshot = { ...previous.snapshot, rows: { ...previous.snapshot.rows } };
+    if (spec.meta && previous.snapshot.meta) progress.meta = metaSnapshot(spec, grid[0] ?? []);
+    let touched = false;
+    const rows = dataRows(spec, grid);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
       const id = typeof row.id === "string" ? row.id.trim() : row.id === null || row.id === undefined ? "" : String(row.id);
       if (id) {
         const before = previous.snapshot.rows[id];
         if (!before) continue; // an id this sheet never had — leave it for the rewrite to clear
         const changes = diffRow(spec.columns, row, before);
         if (changes.length === 0) continue;
+        touched = true;
+        progress.rows[id] = normalizeRow(spec, row);
         const createOnly = changes.find((c) => !spec.columns.find((col) => col.key === c.key)!.editable);
         try {
           if (createOnly) {
@@ -153,22 +165,33 @@ async function runSync(env: Env, link: SheetLink, api: SheetsApi): Promise<SyncR
           errors.rows[id] = { message: errorMessage(err), at: new Date(now).toISOString() };
         }
       } else if (spec.allowsCreate && spec.applyCreate && hasContent(spec.columns, row)) {
+        touched = true;
+        let createdId: string | null = null;
         try {
-          await spec.applyCreate(ctx, row);
+          createdId = await spec.applyCreate(ctx, row);
           applied++;
-          createsByTab.set(spec.name, (createsByTab.get(spec.name) ?? 0) + 1);
         } catch (err) {
           if (err instanceof PartialCreateError) {
             applied++;
-            createsByTab.set(spec.name, (createsByTab.get(spec.name) ?? 0) + 1);
+            createdId = err.createdId;
             errors.rows[err.createdId] = { message: err.message, at: new Date(now).toISOString() };
           } else {
             failed++;
             errors.pending.push({ cells: pendingCells(spec.columns, row), message: errorMessage(err) });
           }
         }
+        if (createdId) {
+          // Stamp the id on the row now, not at the end of the pass: from
+          // here on this row is the thing it created, whatever happens next.
+          const sheetRow = spec.headerRow + i;
+          await api.writeRanges([{ range: a1(spec.name, `A${sheetRow + 1}`), values: [[createdId]] }]);
+          ((grid[sheetRow] ??= [])[0] = createdId);
+          progress.rows[createdId] = normalizeRow(spec, { ...row, id: createdId });
+        }
       }
     }
+    progressByTab.set(spec.name, progress);
+    if (touched) await saveTabSnapshot(env.DB, link.household_id, spec.name, progress, errors);
   }
 
   // The month a person picked sticks; picking the current month again
@@ -197,12 +220,13 @@ async function runSync(env: Env, link: SheetLink, api: SheetsApi): Promise<SyncR
     const editedMeanwhile = !sameGrid(spec, before, now2);
 
     let snapshot: TabSnapshot;
-    if (editedMeanwhile && !createsByTab.get(spec.name)) {
+    const progress = progressByTab.get(spec.name);
+    if (editedMeanwhile && progress) {
       // Someone typed into this tab during the pass. Leave the tab as they
-      // have it; snapshot what was there when the pass started, so their
-      // new typing reads as an edit next time and nothing already applied
-      // is applied twice.
-      snapshot = snapshotFromGrid(spec, before, ctx.month);
+      // have it, and keep the snapshot as of the apply step: their new
+      // typing reads as an edit next time, and nothing already applied is
+      // applied twice.
+      snapshot = progress;
     } else {
       if (!sameGrid(spec, grid, now2)) {
         const lastCol = columnLetter(spec.columns.length - 1);
@@ -323,16 +347,10 @@ function snapshotFromRendered(spec: TabSpec, rendered: RenderedRow[], meta: Cell
   return { rows, month, ...(spec.meta && meta ? { meta: metaSnapshot(spec, meta) } : {}) };
 }
 
-function snapshotFromGrid(spec: TabSpec, grid: CellValue[][], month: string): TabSnapshot {
-  const rows: TabSnapshot["rows"] = {};
-  for (const row of dataRows(spec, grid)) {
-    const id = row.id === null || row.id === undefined ? "" : String(row.id).trim();
-    if (!id) continue;
-    const normalized: Record<string, string> = {};
-    for (const c of spec.columns) normalized[c.key] = normalize(c.type, row[c.key] ?? null);
-    rows[id] = normalized;
-  }
-  return { rows, month, ...(spec.meta ? { meta: metaSnapshot(spec, grid[0] ?? []) } : {}) };
+function normalizeRow(spec: TabSpec, row: SheetRow): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const c of spec.columns) normalized[c.key] = normalize(c.type, row[c.key] ?? null);
+  return normalized;
 }
 
 function metaSnapshot(spec: TabSpec, cells: CellValue[]): Record<string, string> {

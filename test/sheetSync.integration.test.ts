@@ -9,7 +9,7 @@ import { listChanges } from "../src/db/changeLog";
 import { listRecurringPatterns } from "../src/db/recurringPatterns";
 import { createTransaction, getTransaction, listTransactions } from "../src/db/transactions";
 import { listTagsForTransaction } from "../src/db/tags";
-import { acquireSheetLock, getSheetLink, upsertSheetLink } from "../src/db/sheetLinks";
+import { acquireSheetLock, getSheetLink, releaseSheetLock, upsertSheetLink } from "../src/db/sheetLinks";
 import { runAgentTool } from "../src/messaging/agentTools";
 import { syncHouseholdSheet } from "../src/sheets/sync";
 import { FakeSheets } from "./fakeSheets";
@@ -48,7 +48,7 @@ async function seed() {
     rawDescription: "MAVERIK 442",
     normalizedMerchant: "Maverik",
   });
-  await upsertSheetLink(db, household.id, "sheet-under-test-000000000000");
+  await upsertSheetLink(db, household.id, `sheet-for-${household.id}`);
   const sheet = new FakeSheets();
   // First pass: lays out the tabs and fills them; there's nothing to diff yet.
   const first = await syncHouseholdSheet(env, household.id, sheet);
@@ -270,9 +270,72 @@ describe("Categories, Bills and Log", () => {
 });
 
 describe("guards", () => {
+  it("never applies an edit twice when a pass dies after applying it and is retried", async () => {
+    const { household, sheet, costco } = await seed();
+    sheet.addRow("Transactions", { Date: today, Payee: "Lemonade stand", Amount: -4, Account: "Chase Checking" });
+    sheet.type("Transactions", sheet.findRow("Transactions", "id", costco.id)!.index, "Split", "Groceries 120, Gifts 60");
+
+    // Google rate-limits the final write: the pass fails after its edits landed.
+    const realWrite = sheet.writeRanges.bind(sheet);
+    sheet.writeRanges = async (data) => {
+      if (data.length > 1) throw new Error("Google Sheets API 429: quota exceeded");
+      return realWrite(data);
+    };
+    await expect(syncHouseholdSheet(env, household.id, sheet)).rejects.toThrow(/429/);
+    sheet.writeRanges = realWrite;
+
+    // The queue retries the pass.
+    const retry = await syncHouseholdSheet(env, household.id, sheet);
+    expect(retry.applied).toBe(0);
+    const all = await listTransactions(db, household.id);
+    expect(all.filter((t) => t.normalized_merchant === "Lemonade stand")).toHaveLength(1);
+    expect(all.filter((t) => t.split_parent_id === costco.id)).toHaveLength(2);
+    expect((await getSheetLink(db, household.id))!.last_error).toBeNull();
+  });
+
+  it("undoes a categorized cash charge from the Log tab", async () => {
+    const { household, sheet } = await seed();
+    sheet.addRow("Transactions", { Date: today, Payee: "Snow cones", Amount: -6, Category: "Dining Out", Account: "Chase Checking" });
+    await syncHouseholdSheet(env, household.id, sheet);
+    const logRow = sheet.findRow("Log", "Who", "Sheet")!;
+    expect(String(logRow.cells["What changed"])).toMatch(/Snow cones/);
+    sheet.type("Log", logRow.index, "Undo", true);
+    const result = await syncHouseholdSheet(env, household.id, sheet);
+    expect(result.failed).toBe(0);
+    expect((await listTransactions(db, household.id)).some((t) => t.normalized_merchant === "Snow cones")).toBe(false);
+  });
+
+  it("refuses to split a charge that's already split", async () => {
+    const { household, costco } = await seed();
+    const ctx = { householdId: household.id, userId: null };
+    const parts = [{ category: "Groceries", amount_dollars: 100 }, { category: "Gifts", amount_dollars: 80 }];
+    expect((await runAgentTool(env, ctx, "split_transaction", { transaction_id: costco.id, parts })).isError).toBe(false);
+    const again = await runAgentTool(env, ctx, "split_transaction", { transaction_id: costco.id, parts });
+    expect(again.isError).toBe(true);
+    expect(again.content).toMatch(/already split/);
+  });
+
+  it("won't connect one sheet to two households", async () => {
+    const { household } = await seed();
+    const other = await createHousehold(db, { name: "Neighbors" });
+    await expect(upsertSheetLink(db, other.id, `sheet-for-${household.id}`)).rejects.toThrow(/different household/);
+  });
+
+  it("a pass that outlived its lock doesn't release the next pass's lock", async () => {
+    const { household } = await seed();
+    const stale = await acquireSheetLock(db, household.id, -1); // already expired
+    expect(stale).not.toBeNull();
+    const fresh = await acquireSheetLock(db, household.id);
+    expect(fresh).not.toBeNull();
+    await releaseSheetLock(db, household.id, stale!);
+    expect(await acquireSheetLock(db, household.id)).toBeNull();
+    await releaseSheetLock(db, household.id, fresh!);
+    expect(await acquireSheetLock(db, household.id)).not.toBeNull();
+  });
+
   it("skips a pass while another holds the lock", async () => {
     const { household, sheet } = await seed();
-    expect(await acquireSheetLock(db, household.id)).toBe(true);
+    expect(await acquireSheetLock(db, household.id)).not.toBeNull();
     expect((await syncHouseholdSheet(env, household.id, sheet)).status).toBe("locked");
   });
 

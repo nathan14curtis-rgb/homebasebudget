@@ -54,6 +54,7 @@ export const categoriesTab: TabSpec = {
     if (!name) throw new SheetEditError("Give the new category a name");
     const kind = isBlank(row.kind) ? "expense" : text(row.kind).toLowerCase();
     if (kind !== "expense" && kind !== "savings" && kind !== "income") throw new SheetEditError("Kind is expense, savings or income");
-    await runSheetTool(ctx, "create_category", { name, kind });
+    const created = await runSheetTool(ctx, "create_category", { name, kind });
+    return String((created.created as { category_id: string }).category_id);
   },
 };

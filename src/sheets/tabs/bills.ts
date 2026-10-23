@@ -117,7 +117,7 @@ export const billsTab: TabSpec = {
     if (!merchant || isBlank(row.category)) throw new SheetEditError("To add a bill, fill in Merchant contains and Category");
     const kind = isBlank(row.kind) ? "expense" : text(row.kind).toLowerCase();
     const amount = parseMoneyDollars(row.amount);
-    await runSheetTool(ctx, "create_recurring_series", {
+    const created = await runSheetTool(ctx, "create_recurring_series", {
       merchant_contains: merchant,
       kind,
       category: text(row.category),
@@ -125,6 +125,7 @@ export const billsTab: TabSpec = {
       ...scheduleFromRow(row),
       ...(amount === null ? {} : { expected_amount_dollars: Math.abs(amount) }),
     });
+    return String(created.series_id);
   },
 };
 

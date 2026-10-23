@@ -85,8 +85,10 @@ export interface TabSpec {
   meta?: MetaSpec;
   render(ctx: SyncContext): Promise<RenderedRow[]>;
   applyEdit?(ctx: SyncContext, id: string, changes: ChangedCell[], row: SheetRow): Promise<void>;
-  /** A row with no id and something typed in it. */
-  applyCreate?(ctx: SyncContext, row: SheetRow): Promise<void>;
+  /** A row with no id and something typed in it. Returns the new row's
+   * id (the id its rendered row will carry), which is written straight
+   * back into the sheet so a retried pass can't create it twice. */
+  applyCreate?(ctx: SyncContext, row: SheetRow): Promise<string>;
   /** Rows that may be filled at the bottom to add something new. */
   allowsCreate: boolean;
   /** Rows Google should reserve, beyond what's rendered. */

@@ -173,6 +173,7 @@ export const transactionsTab: TabSpec = {
       if (parseBool(row.excluded)) await runSheetTool(ctx, "set_transaction_excluded", { transaction_id: id, excluded: true });
       if (!isBlank(row.flag)) await runSheetTool(ctx, "update_transaction", { transaction_id: id, flag: text(row.flag).toLowerCase() });
     });
+    return id;
   },
 };
 

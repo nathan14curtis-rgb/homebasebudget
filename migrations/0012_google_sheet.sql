@@ -38,3 +38,7 @@ CREATE TABLE sheet_tab_snapshot (
   updated_at    TEXT NOT NULL,
   PRIMARY KEY (household_id, tab)
 );
+
+-- One sheet, one household: every household syncs through the same
+-- service account, so a shared sheet would be overwritten by both.
+CREATE UNIQUE INDEX sheet_link_spreadsheet ON sheet_link (spreadsheet_id);

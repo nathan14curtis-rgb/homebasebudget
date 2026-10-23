@@ -171,6 +171,7 @@ export const budgetTab: TabSpec = {
       }
       if (!isBlank(row.assigned)) await setAssigned(ctx, categoryId, row.assigned ?? null);
     });
+    return categoryId;
   },
 };
 

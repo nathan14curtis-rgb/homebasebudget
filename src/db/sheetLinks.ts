@@ -1,5 +1,12 @@
 import { nowIso } from "./client";
 
+export class SheetAlreadyLinkedError extends Error {
+  constructor() {
+    super("That sheet is already connected to a different household — make a new sheet for this one.");
+    this.name = "SheetAlreadyLinkedError";
+  }
+}
+
 /** Which Google Sheet mirrors a household's budget, and the sync's own
  * bookkeeping (migration 0012, src/sheets/sync.ts). */
 export interface SheetLink {
@@ -27,6 +34,10 @@ export async function listSheetLinks(db: D1Database): Promise<SheetLink[]> {
  * its layout is applied fresh and the old snapshots, which describe the
  * old sheet, are dropped so nothing in the new one reads as an edit. */
 export async function upsertSheetLink(db: D1Database, householdId: string, spreadsheetId: string): Promise<SheetLink> {
+  // Every household syncs through the same service account, so one sheet
+  // linked to two households would have each overwriting the other.
+  const owner = await findSheetOwner(db, spreadsheetId);
+  if (owner && owner !== householdId) throw new SheetAlreadyLinkedError();
   const existing = await getSheetLink(db, householdId);
   const now = nowIso();
   if (existing && existing.spreadsheet_id === spreadsheetId) {
@@ -47,20 +58,30 @@ export async function upsertSheetLink(db: D1Database, householdId: string, sprea
   return (await getSheetLink(db, householdId))!;
 }
 
-/** Take the household's sync lock for `seconds`. False when another pass
- * holds it — that pass will pick up whatever this one would have. */
-export async function acquireSheetLock(db: D1Database, householdId: string, seconds = 240): Promise<boolean> {
+/** Take the household's sync lock for `seconds`. Returns the lock's token,
+ * or null when another pass holds it — that pass will pick up whatever this
+ * one would have. The token is the expiry plus a random suffix, so it
+ * still compares as a time and only its owner can release it. */
+export async function acquireSheetLock(db: D1Database, householdId: string, seconds = 240): Promise<string | null> {
   const now = new Date();
-  const until = new Date(now.getTime() + seconds * 1000).toISOString();
+  const token = `${new Date(now.getTime() + seconds * 1000).toISOString()}|${crypto.randomUUID()}`;
   const result = await db
     .prepare(`UPDATE sheet_link SET locked_until = ? WHERE household_id = ? AND (locked_until IS NULL OR locked_until < ?)`)
-    .bind(until, householdId, now.toISOString())
+    .bind(token, householdId, now.toISOString())
     .run();
-  return result.meta.changes === 1;
+  return result.meta.changes === 1 ? token : null;
 }
 
-export async function releaseSheetLock(db: D1Database, householdId: string): Promise<void> {
-  await db.prepare(`UPDATE sheet_link SET locked_until = NULL WHERE household_id = ?`).bind(householdId).run();
+/** Releases the lock only if it's still this pass's — a pass that ran past
+ * its expiry must not free a lock a newer pass now holds. */
+export async function releaseSheetLock(db: D1Database, householdId: string, token: string): Promise<void> {
+  await db.prepare(`UPDATE sheet_link SET locked_until = NULL WHERE household_id = ? AND locked_until = ?`).bind(householdId, token).run();
+}
+
+/** The household a spreadsheet is already linked to, if any. */
+export async function findSheetOwner(db: D1Database, spreadsheetId: string): Promise<string | null> {
+  const row = await db.prepare(`SELECT household_id FROM sheet_link WHERE spreadsheet_id = ?`).bind(spreadsheetId).first<{ household_id: string }>();
+  return row?.household_id ?? null;
 }
 
 export async function updateSheetLink(
