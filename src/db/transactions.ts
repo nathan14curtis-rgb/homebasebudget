@@ -521,7 +521,15 @@ export async function updateTransaction(
  */
 export async function deleteTransaction(db: D1Database, householdId: string, id: string): Promise<void> {
   await getTransaction(db, householdId, id); // 404s for another household's row before deleting anything
-  // Children first: split_parent_id is a foreign key, so removing the
+  // Audit and clarification rows reference the transaction (and its split
+  // children) with no cascade, so they go first — the same order
+  // deleteTransactionsForAccount uses.
+  const owned = `SELECT id FROM "transaction" WHERE (id = ? OR split_parent_id = ?) AND household_id = ?`;
+  await db.batch([
+    db.prepare(`DELETE FROM transaction_classification WHERE transaction_id IN (${owned})`).bind(id, id, householdId),
+    db.prepare(`DELETE FROM clarification WHERE transaction_id IN (${owned})`).bind(id, id, householdId),
+  ]);
+  // Children next: split_parent_id is a foreign key, so removing the
   // parent out from under them would be rejected outright.
   await db.prepare(`DELETE FROM "transaction" WHERE split_parent_id = ? AND household_id = ?`).bind(id, householdId).run();
   const result = await db.prepare(`DELETE FROM "transaction" WHERE id = ? AND household_id = ?`).bind(id, householdId).run();
@@ -552,6 +560,14 @@ export async function splitTransaction(
   splits: Array<{ amountCents: number; categoryId: string; memo?: string | null }>,
 ): Promise<Transaction[]> {
   const parent = await getTransaction(db, householdId, parentId);
+  if (parent.split_parent_id) throw new Error("that charge is itself part of a split");
+  const existing = await db
+    .prepare(`SELECT COUNT(*) AS n FROM "transaction" WHERE split_parent_id = ? AND household_id = ?`)
+    .bind(parentId, householdId)
+    .first<{ n: number }>();
+  // Splitting twice would leave two sets of parts both counting toward
+  // the budget — undo the first split before making another.
+  if ((existing?.n ?? 0) > 0) throw new Error("that charge is already split — undo the split first");
   const sum = splits.reduce((total, s) => total + s.amountCents, 0);
   if (sum !== parent.amount_cents) {
     throw new Error(

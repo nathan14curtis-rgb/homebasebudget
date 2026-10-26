@@ -1,10 +1,17 @@
 # Home Base
 
-Self-owned budgeting app on Cloudflare Workers, fed by Plaid, with a
-conversational iMessage bot: ask it anything about your money in plain
-English, and tell it what to change — categories, monthly targets, goals,
-what a charge really was — and it writes the change. Full design in
-[`docs/PLAN.md`](docs/PLAN.md).
+Self-owned budgeting app on Cloudflare Workers, fed by Plaid, with two
+ways in:
+
+- **A Google Sheet** you edit like any spreadsheet — envelopes, targets,
+  transactions, bills, categories. It syncs both ways every 5 minutes
+  ([Google Sheet](#google-sheet) below).
+- **A conversational iMessage bot**: ask it anything about your money in
+  plain English, and tell it what to change — categories, monthly targets,
+  goals, what a charge really was — and it writes the change.
+
+Both write the same budget through the same code, so a change made in one
+shows up in the other. Full design in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## How the bot works
 
@@ -21,7 +28,7 @@ nothing else is raised unprompted:
 | Charges it couldn't categorize | the last hour | one batched text per hour: "2 new charges I couldn't place…" (`src/messaging/hourlyCheckin.ts`) |
 | Charges it filed automatically | the last 24 hours | the morning digest at 13:00 UTC (`src/messaging/dailyDigest.ts`) |
 
-Anything older stays in the dashboard's review queue rather than becoming a
+Anything older stays in the sheet (Status: *Needs category*) rather than becoming a
 text about a charge nobody remembers. Overnight, quiet hours defer the
 whole batch to the morning instead of sending at 2am.
 
@@ -40,7 +47,7 @@ with tools that read and write the household's real data
   written, then confirmed with the number that matters now
 
 **The whole budget is writable by text**, not a slice of it — anything the
-dashboard can do, a message can:
+sheet can do, a message can:
 
 | Say | What happens |
 | --- | --- |
@@ -62,9 +69,8 @@ anything and change nothing, `limited` can categorize and tag but not
 re-plan, `full` does everything.
 
 Both sides of every exchange are stored, so follow-ups work ("what about
-last month?"). The same agent and the same thread are available in the
-dashboard under **Ask the bot**, and over the API at
-`POST /api/households/:householdId/chat`.
+last month?"). The same agent and the same thread are available over the
+API at `POST /api/households/:householdId/chat`.
 
 Thank you for using! Please email nathan14curtis@gmail.com with suggestions for UX changes and improvements.
 
@@ -81,10 +87,8 @@ npx wrangler d1 migrations apply curtisclan --local   # creates the local SQLite
 npm run dev                                             # wrangler dev, http://localhost:8787
 ```
 
-`npm run dev` builds `dashboard/dist` for you automatically (via
-`wrangler.jsonc`'s `build.command`) before starting the dev server.
-`GET /health` confirms the Worker is up; `/` serves the dashboard. From
-the terminal instead:
+`GET /health` confirms the Worker is up; `/banks` is the one web page (for
+linking banks). From the terminal:
 
 ```
 curl -X POST localhost:8787/api/households -H 'content-type: application/json' \
@@ -96,18 +100,82 @@ Webhook/queue/LLM code paths need their secrets (below) to do anything —
 without them they fail cleanly with a "missing required secret" error
 rather than doing nothing silently.
 
-**Working on the dashboard itself**: `npm --prefix dashboard run dev`
-starts Vite's dev server with hot reload, proxying `/api/*` to a
-`wrangler dev` you run separately on port 8787 (see `dashboard/vite.config.ts`).
-`npm run build:dashboard` from the repo root rebuilds `dashboard/dist` for
-`wrangler dev`/`deploy` to pick up — Vite doesn't watch it for you there.
-
 ### Tests / typecheck
 
 ```
 npm test          # vitest run — pure logic + D1-backed tests via miniflare
 npm run typecheck # tsc --noEmit
 ```
+
+## Google Sheet
+
+The sheet is the household's editing surface. The database stays the
+source of truth; the sheet is a two-way mirror (`src/sheets/`):
+
+- **Every 5 minutes** the Worker reads the sheet, compares each row with
+  what it last wrote there, and applies only what a person changed —
+  through the same tools the texting bot uses, so every sheet edit is
+  validated, shows up in the **Log** tab, and can be undone (by text, or by
+  ticking **Undo** in the Log).
+- Then it rewrites the sheet from the database, so new bank transactions
+  and bot changes appear within 5 minutes too.
+- If an edit can't be applied (a category that doesn't exist, a split that
+  doesn't add up), the cell goes back to what's saved and that row's
+  **Sync** column says why. A half-filled new row stays in the sheet with
+  what's missing, and is added once it's complete.
+- If a person and the bot change the same cell inside one 5-minute
+  window, the person's edit is applied last and wins.
+
+| Tab | What you do there |
+| --- | --- |
+| **Budget** | One row per envelope for the month in C1 (type `2026-11` to switch). Monthly target / Rollover / Goal date change the plan for every month; Carried in / Assigned change only the month shown (type the total you want — the difference is booked). Tick **Fund to plan** to fill every envelope to its target. Add an envelope on an empty row. |
+| **Transactions** | The last 3 months. Fix category, payee, amount, date, memo, tags, flag; tick Excluded. Split by typing `Groceries 120, Gifts 60` in Split. Add a cash charge on an empty row (Date, Payee, Amount, Account). |
+| **Bills** | Recurring bills and paychecks — edits apply to every month. Confirm or dismiss suggestions with Status; `ended` when a bill stops; `delete` for one added by mistake. |
+| **Bills This Month** | This month's copy of each bill: change just this month's amount or due date, or set Status to `skipped`. |
+| **Categories** | Rename, add (with Kind), or tick Archived. |
+| **Log** | Every change from the sheet, a text, or the bot. Tick **Undo** to reverse one. |
+
+Grey columns are calculated (Spent, Available, bank description…) and
+protected with a warning. Deleting a row does nothing — it comes back on
+the next sync; use Excluded, Archived, or a bill's Status instead.
+
+### Connecting the sheet (one-time)
+
+The Worker signs in to Google as a **service account** — a robot Google
+account that can only touch sheets explicitly shared with it.
+
+1. In [console.cloud.google.com](https://console.cloud.google.com), create
+   a project (or pick one), then **APIs & Services → Library → Google
+   Sheets API → Enable**.
+2. **IAM & Admin → Service Accounts → Create service account.** Name it
+   e.g. `home-base-sheet`. It needs no roles — skip those steps.
+3. Open the new account → **Keys → Add key → Create new key → JSON**. A
+   key file downloads.
+4. Store it as a secret, then delete the file:
+   ```
+   npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON < ~/Downloads/<the-key-file>.json
+   ```
+5. Create a blank Google Sheet, click **Share**, and add the service
+   account's email (`…@….iam.gserviceaccount.com`, shown on its page and
+   inside the key file) as an **Editor**. Share it with each other as
+   normal too.
+6. Text the bot: *"connect our budget sheet https://docs.google.com/spreadsheets/d/…"*.
+   It replies with the email to share with if you missed step 5. The sheet
+   fills itself in within a minute — tabs, dropdowns, formatting and all.
+
+Then `GET /api/households/:householdId/sheet` shows when it last synced
+and the last error (also shown on the `/banks` page);
+`POST …/sheet/sync` runs a pass now. If the sheet stops updating, that
+error is the first thing to read — most often the sheet isn't shared with
+the service account.
+
+## Linking banks
+
+Plaid only links a bank inside a browser, so that's the one web page left:
+open `https://<your-worker>.workers.dev/banks`, sign in with a texted
+code, and press **Link a bank**. The same page shows which accounts need
+re-linking (a bank login that expired). Transactions appear in the sheet
+within the hour.
 
 ## Getting your API credentials
 
@@ -214,6 +282,8 @@ call per uncategorized transaction, occasionally escalating to Sonnet).
    npx wrangler secret put SENDBLUE_SIGNING_SECRET   # set when you create the Sendblue webhook, step 5 below
 
    npx wrangler secret put ANTHROPIC_API_KEY
+
+   npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON < key.json   # see "Connecting the sheet" above
    ```
    List what's set (names only, never values) at any point with
    `npx wrangler secret list`; overwrite one later by running
@@ -222,11 +292,6 @@ call per uncategorized transaction, occasionally escalating to Sonnet).
    ```
    npm run deploy
    ```
-   `wrangler.jsonc`'s `build.command` (`npm run build:dashboard`) runs
-   automatically as part of `wrangler dev`/`wrangler deploy` — including
-   inside Cloudflare's **Workers Builds** Git integration, since that also
-   just runs `wrangler deploy` under the hood. No separate "Build command"
-   setting needed in the Cloudflare dashboard.
 5. **Register webhooks** against your deployed Worker URL:
    - **Plaid**: nothing to register up front — `POST /:householdId/plaid/link-token`
      sets the webhook URL per-item automatically to
@@ -307,7 +372,7 @@ work.
 The one time this matters is if you additionally put the whole
 `*.workers.dev` URL (or a custom domain routed to it) behind **Cloudflare
 Zero Trust / Access** — e.g. to require Google/GitHub SSO before anyone
-can even reach the dashboard's login page. In that case Access intercepts
+can even reach the bank-linking page. In that case Access intercepts
 every request *before* it reaches the Worker, including Plaid's and
 Sendblue's webhook calls, and they'll fail (Plaid retries and eventually
 disables the webhook; Sendblue just drops the delivery). Give the webhook
@@ -339,10 +404,6 @@ paths a bypass policy so Access lets them straight through:
 
 ```
 migrations/             D1 schema (wrangler d1 migrations)
-dashboard/               Vite/React SPA, built to dashboard/dist and served as Workers Assets (see wrangler.jsonc)
-  src/calendar.ts          Pure date + cash-projection math behind the Bills & Income calendar
-  src/useRecurring.ts      The household's recurring series, held once for the pages that share them
-  src/components/          One file per page, plus the dialog, schedule fields and row primitives they share
 src/
   types.ts              Domain types mirroring the schema
   lib/                  Framework-free helpers: money, ids, crypto, CSV, merchant normalization, secrets
@@ -354,6 +415,8 @@ src/
   sendblue/               Sendblue REST client + webhook payload types
   messaging/              The conversational agent + its read/write tools, household group chat,
                           quiet hours, the hourly ask, and the daily digest
+  sheets/                 The Google Sheet two-way sync: service-account auth, the tab definitions
+                          (render from the DB, apply a person's edits), and the read → diff → apply → write pass
   queue/                  The one queue() consumer, branching on which queue a batch came from
   routes/                 Hono route handlers, one file per resource, plus the two webhook routes
   index.ts                Worker entrypoint: fetch + queue + scheduled

@@ -11,7 +11,10 @@ export type TransactionQueueMessage =
   // never trigger an individual clarification text. Only genuinely new,
   // going-forward transactions ask a human (see src/plaid/sync.ts).
   | { type: "categorize"; householdId: string; transactionId: string; skipClarification?: boolean }
-  | { type: "resolve_reply"; householdId: string; userId: string; inboundMessageId: string };
+  | { type: "resolve_reply"; householdId: string; userId: string; inboundMessageId: string }
+  // One pass of the Google Sheet sync (src/sheets/sync.ts): every five
+  // minutes from cron, and right after a sheet is connected.
+  | { type: "sheet_sync"; householdId: string };
 
 export type MessageQueueMessage =
   // The hourly batched ask about charges the cascade couldn't place

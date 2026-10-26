@@ -78,7 +78,8 @@ export type UndoEnvelope =
       status: "upcoming" | "skipped";
     }
   | { kind: "rule_created"; ruleId: string }
-  | { kind: "split"; parentId: string; childIds: string[] };
+  | { kind: "split"; parentId: string; childIds: string[] }
+  | { kind: "transaction_created"; transactionId: string };
 
 export class UndoNotPossibleError extends Error {
   constructor(message: string) {
@@ -204,6 +205,10 @@ export async function applyUndo(env: Env, householdId: string, undo: UndoEnvelop
     case "split":
       for (const childId of undo.childIds) await deleteTransaction(env.DB, householdId, childId);
       await updateTransaction(env.DB, householdId, undo.parentId, { excluded: false });
+      return;
+
+    case "transaction_created":
+      await deleteTransaction(env.DB, householdId, undo.transactionId);
       return;
 
     default: {

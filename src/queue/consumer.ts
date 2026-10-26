@@ -6,6 +6,7 @@ import { processInboundReply } from "../messaging/inboundProcessing";
 import { sendHourlyCheckin } from "../messaging/hourlyCheckin";
 import { sendToHouseholdGroup } from "../messaging/groupChat";
 import { handleItemWebhook, syncPlaidItem } from "../plaid/sync";
+import { syncHouseholdSheet } from "../sheets/sync";
 import type { MessageQueueMessage, TransactionQueueMessage } from "../lib/queueMessages";
 import type { Env } from "../types";
 
@@ -65,11 +66,16 @@ async function handleTransactionQueueMessage(msg: TransactionQueueMessage, env: 
         // a retry of an unexpected error is overwhelmingly likely to fail
         // the same way while re-running whatever partial work succeeded.
         console.error(`[queue] resolve_reply failed for inbound ${inbound.id} (household ${msg.householdId}): ${describeError(err)}`);
-        await sendToHouseholdGroup(env, msg.householdId, "Got your text, but something went wrong on my end handling it — try again, or categorize it from the dashboard.").catch((sendErr) => {
+        await sendToHouseholdGroup(env, msg.householdId, "Got your text, but something went wrong on my end handling it — try again, or categorize it in the budget sheet.").catch((sendErr) => {
           console.error(`[queue] resolve_reply: could not notify household ${msg.householdId} of the failure: ${describeError(sendErr)}`);
         });
       }
       await markInboundMessageProcessed(env.DB, inbound.id);
+      return;
+    }
+    case "sheet_sync": {
+      const result = await syncHouseholdSheet(env, msg.householdId);
+      console.log(`[queue] sheet_sync ${msg.householdId}: ${result.status}, ${result.applied} applied, ${result.failed} refused`);
       return;
     }
   }

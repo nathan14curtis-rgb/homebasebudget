@@ -44,8 +44,10 @@
   //                (PLAN §4.2: "they get dropped").
   //   0 13 * * * — morning digest of the last 24 hours of automatic
   //                filings, 13:00 UTC ≈ 6-7am Mountain depending on DST.
+  //   */5 * * * * — the Google Sheet sync (src/sheets/sync.ts): apply what
+  //                people typed into the sheet, then refresh it.
   "triggers": {
-    "crons": ["0 * * * *", "0 13 * * *"]
+    "crons": ["0 * * * *", "0 13 * * *", "*/5 * * * *"]
   },
 
   "vars": {
@@ -65,22 +67,6 @@
       "head_sampling_rate": 1,
       "invocation_logs": true
     }
-  },
-
-  // Dashboard (PLAN §9), built into dashboard/dist. Static files matching
-  // a request are served directly; anything that doesn't match
-  // (/api/*, /webhooks/*, /health) falls through to this Worker.
-  "assets": {
-    "binding": "ASSETS",
-    "directory": "./dashboard/dist"
-  },
-
-  // Wrangler runs this itself before dev/deploy — including inside
-  // Cloudflare's Workers Builds Git integration, since that also just
-  // runs `wrangler deploy` — so dashboard/dist is always fresh without a
-  // separately configured "Build command" in the Cloudflare dashboard.
-  "build": {
-    "command": "npm run build:dashboard"
   }
 
   // Secrets (Plaid client id/secret, Sendblue keys, Anthropic key, token

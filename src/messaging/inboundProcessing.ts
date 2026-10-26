@@ -23,7 +23,7 @@ import { sendToHouseholdGroup } from "./groupChat";
 export async function processInboundReply(env: Env, householdId: string, userId: string, content: string, anthropicClient?: Anthropic): Promise<void> {
   if (!env.ANTHROPIC_API_KEY && !anthropicClient) {
     console.error(`[inboundReply] ANTHROPIC_API_KEY not configured — cannot answer household ${householdId}`);
-    await sendToHouseholdGroup(env, householdId, "Got your text, but I can't answer yet — that part isn't set up. You can still categorize from the dashboard.");
+    await sendToHouseholdGroup(env, householdId, "Got your text, but I can't answer yet — that part isn't set up. You can still categorize in the budget sheet.");
     return;
   }
 
@@ -32,7 +32,7 @@ export async function processInboundReply(env: Env, householdId: string, userId:
     ({ reply } = await runAgentTurn(env, { householdId, userId, channel: "imessage", text: content }, anthropicClient));
   } catch (err) {
     console.error(`[inboundReply] agent turn failed for household ${householdId}: ${describeError(err)}`);
-    await sendToHouseholdGroup(env, householdId, "Got your text, but hit a hiccup working on it — try again in a bit, or use the dashboard.");
+    await sendToHouseholdGroup(env, householdId, "Got your text, but hit a hiccup working on it — try again in a bit, or use the budget sheet.");
     return;
   }
 
