@@ -203,17 +203,25 @@ async function runSync(env: Env, link: SheetLink, api: SheetsApi): Promise<SyncR
   // being applied must not be overwritten (see writeTab).
   const ctx: SyncContext = { ...baseCtx, month: nextMonth };
   const secondRead = applied + failed > 0 ? await readTabs(api) : firstRead;
-  await ensureRows(api, tabs);
+  const renderedTabs = [];
+  for (const spec of TABS) {
+    const rendered = await spec.render(ctx);
+    const meta = spec.meta ? await spec.meta.render(ctx) : null;
+    renderedTabs.push({ spec, rendered, meta });
+  }
+  await ensureRows(
+    api,
+    tabs,
+    new Map(renderedTabs.map(({ spec, rendered }) => [spec.name, spec.headerRow + rendered.length + errorsByTab.get(spec.name)!.pending.length])),
+  );
 
   const writes: Array<{ range: string; values: CellValue[][] }> = [];
   const clears: string[] = [];
-  for (const spec of TABS) {
-    const rendered = await spec.render(ctx);
+  for (const { spec, rendered, meta } of renderedTabs) {
     const errors = errorsByTab.get(spec.name)!;
     const renderedIds = new Set(rendered.map((r) => r.id));
     for (const id of Object.keys(errors.rows)) if (!renderedIds.has(id)) delete errors.rows[id];
 
-    const meta = spec.meta ? await spec.meta.render(ctx) : null;
     const grid = buildGrid(spec, rendered, errors, meta);
     const before = firstRead.get(spec.name) ?? [];
     const now2 = secondRead.get(spec.name) ?? [];
@@ -359,13 +367,14 @@ function metaSnapshot(spec: TabSpec, cells: CellValue[]): Record<string, string>
   return out;
 }
 
-/** Grow a tab before writing past its last row — the Values API won't. */
-async function ensureRows(api: SheetsApi, tabs: SheetTabInfo[]): Promise<void> {
+/** Grow a tab before writing past its last row — the Values API won't.
+ * Keeps a few hundred empty rows below the data for typing new ones. */
+async function ensureRows(api: SheetsApi, tabs: SheetTabInfo[], rowsNeeded: Map<string, number>): Promise<void> {
   const requests: unknown[] = [];
   for (const tab of tabs) {
     const spec = TABS.find((s) => s.name === tab.title);
     if (!spec) continue;
-    const wanted = (spec.minRows ?? 1000) + spec.headerRow;
+    const wanted = Math.max((spec.minRows ?? 1000) + spec.headerRow, (rowsNeeded.get(spec.name) ?? 0) + 300);
     if (tab.rowCount < wanted) requests.push({ appendDimension: { sheetId: tab.sheetId, dimension: "ROWS", length: wanted - tab.rowCount } });
   }
   await api.batchUpdate(requests);

@@ -2,13 +2,12 @@ import { listAccounts } from "../../db/accounts";
 import { listCategories } from "../../db/categories";
 import { listTagsByTransaction } from "../../db/tags";
 import { listTransactionsWithVerifyState } from "../../db/transactions";
-import { previousMonth } from "../../db/envelopes";
 import { centsToDollars, isBlank, parseBool, parseDate, parseMoneyDollars, parseTags, text } from "../cells";
 import type { CellValue } from "../client";
 import { afterCreate, changed, runSheetTool, SheetEditError, withSync, type ChangedCell, type RenderedRow, type SyncContext, type TabSpec } from "../layout";
 
 /**
- * Every charge from the last three months, newest first.
+ * Every charge in the database, newest first.
  *
  * Fix anything a person can see — payee, amount, date, category, memo,
  * tags, excluded, flag — by typing over it. Split a charge by writing its
@@ -19,7 +18,6 @@ import { afterCreate, changed, runSheetTool, SheetEditError, withSync, type Chan
 
 const FLAGS = ["red", "orange", "yellow", "green", "blue", "purple"];
 const SPLIT_CHILD_MARK = "↳ part of a split";
-const MONTHS_SHOWN = 3;
 
 export const transactionsTab: TabSpec = {
   name: "Transactions",
@@ -50,10 +48,8 @@ export const transactionsTab: TabSpec = {
   ]),
 
   async render(ctx) {
-    let from = ctx.today.slice(0, 7);
-    for (let i = 1; i < MONTHS_SHOWN; i++) from = previousMonth(from);
     const [transactions, categories, accounts, tagsByTxn] = await Promise.all([
-      listTransactionsWithVerifyState(ctx.env.DB, ctx.householdId, { fromDate: `${from}-01`, limit: 1000 }),
+      listTransactionsWithVerifyState(ctx.env.DB, ctx.householdId, { all: true }),
       listCategories(ctx.env.DB, ctx.householdId),
       listAccounts(ctx.env.DB, ctx.householdId),
       listTagsByTransaction(ctx.env.DB, ctx.householdId),

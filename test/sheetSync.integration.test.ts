@@ -78,6 +78,33 @@ describe("first sync", () => {
   });
 });
 
+describe("history", () => {
+  it("shows every charge on record, not just recent months, and grows the tab to fit", async () => {
+    const { household, checking, sheet } = await seed();
+    const old = await createTransaction(db, household.id, {
+      accountId: checking.id,
+      postedAt: "2025-01-15",
+      amountCents: -999,
+      rawDescription: "OLD COFFEE",
+      normalizedMerchant: "Old coffee",
+    });
+    for (let i = 0; i < 1200; i++) {
+      await createTransaction(db, household.id, {
+        accountId: checking.id,
+        postedAt: "2025-06-01",
+        amountCents: -100 - i,
+        rawDescription: `BULK ${i}`,
+        normalizedMerchant: `Bulk ${i}`,
+      });
+    }
+    sheet.tabs.get("Transactions")!.rowCount = 1000;
+    await syncHouseholdSheet(env, household.id, sheet);
+    expect(sheet.findRow("Transactions", "id", old.id)).not.toBeNull();
+    expect(sheet.findRow("Transactions", "Payee", "Bulk 1199")).not.toBeNull();
+    expect(sheet.tabs.get("Transactions")!.rowCount).toBeGreaterThan(1203);
+  }, 60_000);
+});
+
 describe("editing a transaction", () => {
   it("categorizes, renames, tags and flags through the agent tools, and logs it as the sheet", async () => {
     const { household, sheet, costco } = await seed();

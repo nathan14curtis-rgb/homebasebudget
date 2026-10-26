@@ -82,6 +82,10 @@ export interface ListTransactionsFilter {
   toDate?: string; // inclusive, posted_at
   needsReview?: boolean; // category_id IS NULL
   limit?: number;
+  /** Every matching row, no cap. Only for internal callers that need the
+   * whole history (the Google Sheet's Transactions tab) — HTTP routes keep
+   * the 1000-row cap. */
+  all?: boolean;
 }
 
 /** Shared by listTransactions and listTransactionsWithVerifyState so the
@@ -178,7 +182,7 @@ export async function listTransactionsWithVerifyState(
   filter: ListTransactionsFilter = {},
 ): Promise<TransactionWithVerifyState[]> {
   const { clauses, params } = buildTransactionFilterClauses(householdId, filter, "t.");
-  const limit = Math.min(filter.limit ?? 200, 1000);
+  const limit = filter.all ? -1 : Math.min(filter.limit ?? 200, 1000); // SQLite: LIMIT -1 = no limit
   const { results } = await db
     .prepare(
       `SELECT t.*,
