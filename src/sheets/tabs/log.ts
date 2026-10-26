@@ -104,6 +104,7 @@ export const README_ROWS: string[][] = [
   ["Budget — this month's envelopes. Change the month in C1 (type 2026-11). Tick 'Fund to plan' to fill every envelope up to its target."],
   ["   Monthly target, Rollover and Goal date change the plan for every month. Carried in and Assigned change only the month shown."],
   ["   Add an envelope on an empty row at the bottom: Category name (+ Group, Monthly target). Add a Goal date to make it a savings goal."],
+  ["Cash Flow — a 13-week forecast (read-only): beginning cash, recurring income and bills, your average weekly spending, ending cash."],
   ["Transactions — every charge on record. Fix category, payee, amount, date, memo, tags, flag; tick Excluded to keep a charge out of the budget."],
   ["   Split a charge by typing its parts in Split: 'Groceries 120, Household 60'. Add a cash charge on an empty row (Date, Payee, Amount, Account)."],
   ["Bills — recurring bills and paychecks. Changes apply to every month. Status: confirm or dismiss suggestions, 'ended' when a bill stops."],

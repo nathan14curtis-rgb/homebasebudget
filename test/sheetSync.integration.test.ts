@@ -88,15 +88,18 @@ describe("history", () => {
       rawDescription: "OLD COFFEE",
       normalizedMerchant: "Old coffee",
     });
-    for (let i = 0; i < 1200; i++) {
-      await createTransaction(db, household.id, {
-        accountId: checking.id,
-        postedAt: "2025-06-01",
-        amountCents: -100 - i,
-        rawDescription: `BULK ${i}`,
-        normalizedMerchant: `Bulk ${i}`,
-      });
-    }
+    // One batched write rather than 1,200 — keeps the test light on storage.
+    const now = new Date().toISOString();
+    await db.batch(
+      Array.from({ length: 1200 }, (_, i) =>
+        db
+          .prepare(
+            `INSERT INTO "transaction" (id, household_id, account_id, posted_at, amount_cents, raw_description, normalized_merchant, pending, source, created_at, updated_at)
+             VALUES (?, ?, ?, '2025-06-01', ?, ?, ?, 0, 'manual', ?, ?)`,
+          )
+          .bind(`txn_bulk_${household.id}_${i}`, household.id, checking.id, -100 - i, `BULK ${i}`, `Bulk ${i}`, now, now),
+      ),
+    );
     sheet.tabs.get("Transactions")!.rowCount = 1000;
     await syncHouseholdSheet(env, household.id, sheet);
     expect(sheet.findRow("Transactions", "id", old.id)).not.toBeNull();

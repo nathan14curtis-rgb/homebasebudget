@@ -130,6 +130,7 @@ source of truth; the sheet is a two-way mirror (`src/sheets/`):
 | --- | --- |
 | **Budget** | One row per envelope for the month in C1 (type `2026-11` to switch). Monthly target / Rollover / Goal date change the plan for every month; Carried in / Assigned change only the month shown (type the total you want — the difference is booked). Tick **Fund to plan** to fill every envelope to its target. Add an envelope on an empty row. |
 | **Transactions** | Every charge in the database. Fix category, payee, amount, date, memo, tags, flag; tick Excluded. Split by typing `Groceries 120, Gifts 60` in Split. Add a cash charge on an empty row (Date, Payee, Amount, Account). |
+| **Cash Flow** | Read-only 13-week forecast: Beginning cash (checking + savings − card balances), recurring Income and Bills due that week, your average weekly non-bill spending (last 12 weeks), Ending cash. "What's due" lists each item. |
 | **Bills** | Recurring bills and paychecks — edits apply to every month. Confirm or dismiss suggestions with Status; `ended` when a bill stops; `delete` for one added by mistake. |
 | **Bills This Month** | This month's copy of each bill: change just this month's amount or due date, or set Status to `skipped`. |
 | **Categories** | Rename, add (with Kind), or tick Archived. |
