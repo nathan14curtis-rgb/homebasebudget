@@ -19,6 +19,7 @@ import { billsTab, billsThisMonthTab } from "./tabs/bills";
 import { categoriesTab } from "./tabs/categories";
 import { LISTS_TAB, logTab, README_ROWS, README_TAB, renderLists } from "./tabs/log";
 import { transactionsTab } from "./tabs/transactions";
+import { cashFlowTab } from "./tabs/cashFlow";
 
 /**
  * The two-way sync between the database and the household's Google Sheet.
@@ -42,13 +43,13 @@ import { transactionsTab } from "./tabs/transactions";
 
 /** Bump when columns, dropdowns or protections change, so every linked
  * sheet gets its formatting re-applied once. */
-export const LAYOUT_VERSION = 1;
+export const LAYOUT_VERSION = 2;
 
 /** Tabs in the order their edits are applied: categories first so a new
  * category typed there can be used on any other tab in the same pass. */
-export const TABS: TabSpec[] = [categoriesTab, budgetTab, billsTab, billsThisMonthTab, transactionsTab, logTab];
+export const TABS: TabSpec[] = [categoriesTab, budgetTab, billsTab, billsThisMonthTab, transactionsTab, logTab, cashFlowTab];
 /** Tabs in the order they appear in the sheet. */
-const DISPLAY_ORDER = [README_TAB, budgetTab.name, transactionsTab.name, billsTab.name, billsThisMonthTab.name, categoriesTab.name, logTab.name, LISTS_TAB];
+const DISPLAY_ORDER = [README_TAB, budgetTab.name, cashFlowTab.name, transactionsTab.name, billsTab.name, billsThisMonthTab.name, categoriesTab.name, logTab.name, LISTS_TAB];
 
 const ERROR_TTL_MS = 60 * 60 * 1000;
 
@@ -536,6 +537,14 @@ function tabFormatRequests(spec: TabSpec, sheetId: number): unknown[] {
       },
     });
     const cell = (index: number) => ({ sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: index, endColumnIndex: index + 1 });
+    if (spec.name !== budgetTab.name) {
+      // A read-only summary row: nothing to type into, so protect all of it.
+      for (const index of [3, 5]) {
+        requests.push({ repeatCell: { range: cell(index), cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: MONEY_PATTERN } } }, fields: "userEnteredFormat.numberFormat" } });
+      }
+      requests.push({ addProtectedRange: { protectedRange: { range: { sheetId, startRowIndex: 0, endRowIndex: 1 }, warningOnly: true, description: `${PROTECTION_PREFIX}${spec.name}:meta` } } });
+      return requests;
+    }
     requests.push(
       { repeatCell: { range: cell(BUDGET_META.month), cell: { userEnteredFormat: { numberFormat: { type: "TEXT" } } }, fields: "userEnteredFormat.numberFormat" } },
       { repeatCell: { range: cell(BUDGET_META.ready), cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: MONEY_PATTERN } } }, fields: "userEnteredFormat.numberFormat" } },
